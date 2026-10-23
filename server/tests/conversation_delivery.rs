@@ -22,6 +22,88 @@ const FOLLOW_UP: &str = "Perform any necessary follow-up actions in response to 
 const SHELL_FOLLOW_UP: &str = "Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.";
 
 #[tokio::test]
+async fn subagent_without_message_ids_can_start_and_continue_from_checkpoint() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+    let mut checkpoint = None;
+    let mut user_ids = Vec::new();
+    for (request_id, text) in [
+        ("child-start", "inspect the code"),
+        ("child-resume", "continue"),
+    ] {
+        provider.push(stop_response(request_id, "child response"));
+        let handle = registry.get_or_create(request_id).await.unwrap();
+        let (state, blobs) = drive_completion(
+            &handle,
+            pb::AgentClientMessage {
+                message: Some(pb::agent_client_message::Message::RunRequest(
+                    pb::AgentRunRequest {
+                        conversation_state: checkpoint,
+                        conversation_id: Some("child-conversation".into()),
+                        subagent_type_name: Some("explore".into()),
+                        run_id: Some("reused-child-run".into()),
+                        requested_model: Some(pb::RequestedModel {
+                            model_id: "test-model".into(),
+                            ..Default::default()
+                        }),
+                        action: Some(pb::ConversationAction {
+                            action: Some(pb::conversation_action::Action::UserMessageAction(
+                                pb::UserMessageAction {
+                                    user_message: Some(pb::UserMessage {
+                                        text: text.into(),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                },
+                            )),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            },
+        )
+        .await;
+        let turn = pb::ConversationTurnStructure::decode(
+            blobs.get(state.turns.last().unwrap()).unwrap().as_slice(),
+        )
+        .unwrap();
+        let pb::conversation_turn_structure::Turn::AgentConversationTurn(turn) = turn.turn.unwrap()
+        else {
+            panic!("expected child agent turn")
+        };
+        let user =
+            pb::UserMessage::decode(blobs.get(&turn.user_message).unwrap().as_slice()).unwrap();
+        assert_eq!(user.text, text);
+        assert!(!user.message_id.is_empty());
+        user_ids.push(user.message_id);
+        checkpoint = Some(state);
+    }
+    assert_ne!(user_ids[0], user_ids[1]);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].prompt, requests[1].prompt);
+    assert_eq!(
+        requests[0].history,
+        requests[1].history[..requests[0].history.len()]
+    );
+    let history = serde_json::to_string(&requests[1].history).unwrap();
+    assert_eq!(history.matches("inspect the code").count(), 1);
+    assert_eq!(history.matches("continue").count(), 1);
+}
+
+#[tokio::test]
 async fn background_subagent_completion_starts_a_simulated_parent_turn() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
@@ -368,6 +450,11 @@ async fn drive_completion(
             .unwrap();
         let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
         if flags & connect::END_STREAM_FLAG != 0 {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+                serde_json::json!({}),
+                "Run must finish successfully"
+            );
             break;
         }
         let server = pb::AgentServerMessage::decode(payload).unwrap();

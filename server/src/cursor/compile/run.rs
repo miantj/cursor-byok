@@ -133,7 +133,7 @@ pub(crate) async fn prepare(
         starts_turn,
         compacting,
         background_completion,
-    } = action(request)?;
+    } = action(request_id, request)?;
     let checkpoint_mode = if request.subagent_type_name.is_some() {
         Mode::Subagent
     } else {
@@ -399,7 +399,7 @@ fn execution_run_id(request_id: &str) -> RunId {
     RunId::new(format!("{request_id}:{}", &execution_id[..8]))
 }
 
-fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
+fn action(request_id: &str, request: &pb::AgentRunRequest) -> Result<ActionProjection> {
     let conversation_mode = request
         .conversation_state
         .as_ref()
@@ -423,9 +423,13 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
     };
     match action {
         pb::conversation_action::Action::UserMessageAction(action) => {
-            let user = action.user_message.as_ref().ok_or_else(|| {
+            let mut user = action.user_message.clone().ok_or_else(|| {
                 Error::Protocol("Cursor user message action has no UserMessage".into())
             })?;
+            // Cursor subagent actions can omit message IDs; keep their identity stable across request retries.
+            if user.message_id.is_empty() && request.subagent_type_name.is_some() {
+                user.message_id = format!("subagent:{request_id}");
+            }
             let mode = if user.mode == pb::AgentMode::Unspecified as i32 {
                 conversation_mode.unwrap_or(user.mode)
             } else {
@@ -439,7 +443,7 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
             if user.text.trim() == "/summarize" {
                 return Ok(ActionProjection {
                     mode,
-                    turn_user: Some(user.clone()),
+                    turn_user: Some(user),
                     action_context: String::new(),
                     event_id: None,
                     input_id: None,
@@ -464,7 +468,7 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
             let input_id = format!("cursor:user:{}", user.message_id);
             Ok(ActionProjection {
                 mode,
-                turn_user: Some(user.clone()),
+                turn_user: Some(user),
                 action_context: context.join("\n\n"),
                 event_id: None,
                 input_id: Some(input_id),
@@ -610,5 +614,62 @@ fn exec_context(
             .unwrap_or_default(),
         admin_command_denylist: request_context.admin_command_denylist.clone(),
         mcp_routes: context::meta_mcp_routes(request_context),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_request(message_id: &str, subagent: bool) -> pb::AgentRunRequest {
+        pb::AgentRunRequest {
+            subagent_type_name: subagent.then(|| "explore".into()),
+            action: Some(pb::ConversationAction {
+                action: Some(pb::conversation_action::Action::UserMessageAction(
+                    pb::UserMessageAction {
+                        user_message: Some(pb::UserMessage {
+                            text: "inspect the code".into(),
+                            message_id: message_id.into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn missing_subagent_message_id_is_stable_per_request() {
+        let request = user_request("", true);
+        let first = action("child-request", &request).unwrap();
+        let retry = action("child-request", &request).unwrap();
+        let continuation = action("next-child-request", &request).unwrap();
+        let user = first.turn_user.unwrap();
+        assert!(!user.message_id.is_empty());
+        assert_eq!(user.message_id, retry.turn_user.unwrap().message_id);
+        assert_eq!(first.input_id, retry.input_id);
+        assert_ne!(first.input_id, continuation.input_id);
+        assert_ne!(user.message_id, continuation.turn_user.unwrap().message_id);
+    }
+
+    #[test]
+    fn regular_user_message_still_requires_message_id() {
+        assert!(matches!(
+            action("root-request", &user_request("", false)),
+            Err(Error::Protocol(message)) if message == "Cursor user message action has no message_id"
+        ));
+    }
+
+    #[test]
+    fn supplied_subagent_message_id_is_preserved() {
+        let projection = action("child-request", &user_request("client-id", true)).unwrap();
+        assert_eq!(projection.turn_user.unwrap().message_id, "client-id");
+        assert_eq!(
+            projection.input_id.as_deref(),
+            Some("cursor:user:client-id")
+        );
     }
 }

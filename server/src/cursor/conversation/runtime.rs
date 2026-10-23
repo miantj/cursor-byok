@@ -437,8 +437,24 @@ impl ConversationRuntime {
                                         }
                                         Some(pb::conversation_action::Action::CancelAction(_)) => {
                                             if let Some(generation) = current.as_ref() {
-                                                if let Some(run) = generation.run.lock().clone() {
+                                                let run = generation.run.lock().clone();
+                                                if let Some(run) = run {
                                                     run.cancel();
+                                                } else if !waiting_for_action {
+                                                    // Preparation has no RunHandle yet. A completed turn
+                                                    // is waiting_for_action and must stay open.
+                                                    generation.superseded.cancel();
+                                                    if let Some(run) = generation.run.lock().clone()
+                                                    {
+                                                        run.cancel();
+                                                    }
+                                                    handle.begin_close();
+                                                    pending_finish = Some((
+                                                        generation.id,
+                                                        TransportFinish::Cancelled,
+                                                    ));
+                                                    draining = true;
+                                                    waiting_for_action = false;
                                                 }
                                                 for id in
                                                     generation.tool_runtime.drain_running().await
@@ -805,14 +821,6 @@ fn spawn_run_request(
         };
         let _ = core_run.await;
         registry.release(&conversation_id, &run_id).await;
-        if generation
-            .run
-            .lock()
-            .as_ref()
-            .is_some_and(|run| run.run_id() == &run_id)
-        {
-            *generation.run.lock() = None;
-        }
         if !generation.superseded.is_cancelled() {
             let _ = handle
                 .command(TransportCommand::RunFinished {
@@ -820,6 +828,16 @@ fn spawn_run_request(
                     finish,
                 })
                 .await;
+        }
+        // Drop the handle only after RunFinished is queued, so a CancelAction
+        // still sees the finished Run instead of treating it as preparation.
+        if generation
+            .run
+            .lock()
+            .as_ref()
+            .is_some_and(|run| run.run_id() == &run_id)
+        {
+            *generation.run.lock() = None;
         }
     });
 }

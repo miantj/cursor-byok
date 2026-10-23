@@ -423,6 +423,192 @@ async fn runtime_cancel_action_aborts_active_exec_before_canceled_end_stream() {
 }
 
 #[tokio::test]
+async fn runtime_cancel_action_stops_preparation_waiting_for_a_missing_blob() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    let assets = PromptAssets::embedded().unwrap();
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+    let handle = registry.get_or_create("cancel-preparation").await.unwrap();
+    let mut output = handle.subscribe();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(client_run_for_model_with_state(
+                "cancel-preparation",
+                "cancel-preparation-conversation",
+                "test-model",
+                Some(pb::ConversationStateStructure {
+                    root_prompt_messages_json: vec![vec![1; 32]],
+                    ..Default::default()
+                }),
+            )),
+        })
+        .await
+        .unwrap();
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+    let server = pb::AgentServerMessage::decode(payload).unwrap();
+    assert!(matches!(
+        server.message,
+        Some(pb::agent_server_message::Message::KvServerMessage(
+            pb::KvServerMessage {
+                message: Some(pb::kv_server_message::Message::GetBlobArgs(_)),
+                ..
+            }
+        ))
+    ));
+
+    handle
+        .command(TransportCommand::Append {
+            seqno: 1,
+            message: Box::new(runtime_cancel_action()),
+        })
+        .await
+        .unwrap();
+    expect_cancelled_output(&mut output).await;
+    assert!(
+        provider.requests().is_empty(),
+        "cancelled preparation must not call the provider"
+    );
+}
+
+#[tokio::test]
+async fn runtime_cancel_action_stops_waiting_for_a_checkpoint_acknowledgement() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    provider.push_pending();
+    let registry = TransportRegistry::new(
+        store.clone(),
+        Arc::new(provider.clone()),
+        PromptCompiler::new(PromptAssets::embedded().unwrap()),
+    );
+    let handle = registry.get_or_create("cancel-checkpoint").await.unwrap();
+    let mut output = handle.subscribe();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(client_run_for(
+                "cancel-checkpoint",
+                "cancel-checkpoint-conversation",
+            )),
+        })
+        .await
+        .unwrap();
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+    let server = pb::AgentServerMessage::decode(payload).unwrap();
+    assert!(matches!(
+        server.message,
+        Some(pb::agent_server_message::Message::KvServerMessage(
+            pb::KvServerMessage {
+                message: Some(pb::kv_server_message::Message::SetBlobArgs(_)),
+                ..
+            }
+        ))
+    ));
+    // Withhold the acknowledgement to reproduce a stalled Cursor checkpoint upload.
+    handle
+        .command(TransportCommand::Append {
+            seqno: 1,
+            message: Box::new(runtime_cancel_action()),
+        })
+        .await
+        .unwrap();
+    expect_cancelled_output(&mut output).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs LIMIT 1")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+            if status == "cancelled" {
+                break;
+            }
+            assert_eq!(
+                status, "running",
+                "cancellation must not be recorded as a failure"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled Run must finish and persist its status");
+    assert!(provider.requests().is_empty());
+}
+
+async fn expect_cancelled_output(output: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(frame) = output.recv().await {
+            let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+            if flags & connect::END_STREAM_FLAG != 0 {
+                let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(json["error"]["code"], "canceled");
+                assert_eq!(output.recv().await, None);
+                return;
+            }
+        }
+        panic!("RunSSE closed without canceled EndStream");
+    })
+    .await
+    .expect("stop must not wait for an unresponsive Cursor client");
+}
+
+#[tokio::test]
+async fn cancel_after_turn_ended_leaves_the_transport_open() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    provider.push(text_response("first turn"));
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+    let handle = registry.get_or_create("cancel-after-turn").await.unwrap();
+    let mut output = handle.subscribe();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(client_run_for(
+                "cancel-after-turn",
+                "cancel-after-turn-conversation",
+            )),
+        })
+        .await
+        .unwrap();
+
+    let mut append_seqno = 1;
+    wait_for_turn_ended(&handle, &mut output, &mut append_seqno).await;
+    assert_transport_remains_open(&handle, &mut output, &mut append_seqno).await;
+    handle
+        .command(TransportCommand::Append {
+            seqno: append_seqno,
+            message: Box::new(runtime_cancel_action()),
+        })
+        .await
+        .unwrap();
+    append_seqno += 1;
+    assert_transport_remains_open(&handle, &mut output, &mut append_seqno).await;
+}
+
+#[tokio::test]
 async fn queued_user_message_after_turn_ended_starts_the_next_turn() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();

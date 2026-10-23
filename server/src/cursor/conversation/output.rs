@@ -111,7 +111,25 @@ impl ConversationOutput {
     }
 
     pub async fn run(mut self) -> Result<RunFinish> {
-        let result = self.run_inner().await;
+        let cancellation = self.run.cancellation();
+        let superseded = self.superseded.clone();
+        let result = tokio::select! {
+            biased;
+            _ = superseded.cancelled() => Ok(RunFinish::Transport(TransportFinish::Cancelled)),
+            _ = cancellation.cancelled() => Ok(RunFinish::Transport(TransportFinish::Cancelled)),
+            result = self.run_inner() => result,
+        };
+        // Replacing a generation cancels `superseded` before the RunHandle exists.
+        // If the handle was installed in that window, stop the engine here.
+        if self.superseded.is_cancelled() {
+            self.run.cancel();
+        }
+        if matches!(
+            &result,
+            Ok(RunFinish::Transport(TransportFinish::Cancelled))
+        ) {
+            self.abort_execs().await;
+        }
         if let Err(error) = &result {
             if !self.superseded.is_cancelled() {
                 self.abort_execs().await;
@@ -174,8 +192,6 @@ impl ConversationOutput {
 
         loop {
             if self.superseded.is_cancelled() {
-                worker.abort();
-                self.abort_execs().await;
                 return Ok(RunFinish::Transport(TransportFinish::Cancelled));
             }
             let input = if let Ok(action) = self.runtime_actions.try_recv() {
@@ -186,8 +202,6 @@ impl ConversationOutput {
                 tokio::select! {
                     biased;
                     _ = self.superseded.cancelled() => {
-                        worker.abort();
-                        self.abort_execs().await;
                         return Ok(RunFinish::Transport(TransportFinish::Cancelled));
                     }
                     action = self.runtime_actions.recv() => Input::RuntimeAction(action.map(Box::new)),
@@ -248,7 +262,6 @@ impl ConversationOutput {
                     return Err(Error::Protocol("runtime action channel closed".into()));
                 }
                 Input::Event(None) => {
-                    worker.abort();
                     return Err(Error::Protocol("core event channel closed".into()));
                 }
                 Input::Event(Some(event)) => match event {
@@ -728,8 +741,6 @@ impl ConversationOutput {
                     }
                     RunEvent::Ended(outcome) => {
                         if self.superseded.is_cancelled() {
-                            worker.abort();
-                            self.abort_execs().await;
                             return Ok(RunFinish::Transport(TransportFinish::Cancelled));
                         }
                         return match outcome {
@@ -765,8 +776,6 @@ impl ConversationOutput {
                                 Ok(RunFinish::TurnCompleted)
                             }
                             RunOutcome::Cancelled => {
-                                worker.abort();
-                                self.abort_execs().await;
                                 Ok(RunFinish::Transport(TransportFinish::Cancelled))
                             }
                             RunOutcome::Failed(failure) => {

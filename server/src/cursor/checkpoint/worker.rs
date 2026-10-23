@@ -144,6 +144,12 @@ impl CheckpointWorker {
     }
 }
 
+impl Drop for CheckpointWorker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn publish_settled(
     store: &Store,
     builder: &mut CheckpointBuilder,

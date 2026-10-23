@@ -1038,8 +1038,8 @@ pub(super) async fn wait_for_state_ready(
 ) -> std::result::Result<(), RunOutcome> {
     let result = tokio::select! {
         biased;
-        result = ready => result,
         _ = cancellation.cancelled() => return Err(RunOutcome::Cancelled),
+        result = ready => result,
     };
     match result {
         Ok(Ok(())) => Ok(()),
