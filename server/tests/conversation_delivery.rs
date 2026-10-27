@@ -22,6 +22,51 @@ const FOLLOW_UP: &str = "Perform any necessary follow-up actions in response to 
 const SHELL_FOLLOW_UP: &str = "Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.";
 
 #[tokio::test]
+async fn failed_background_subagent_reports_failure_to_the_parent() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    provider.push(stop_response("parent-call", "handled child failure"));
+    let assets =
+        PromptAssets::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompt/cursor"))
+            .unwrap();
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+    let handle = registry
+        .get_or_create("failed-child-notification")
+        .await
+        .unwrap();
+    let mut notification = completion_run_with_detail(
+        "failed-child",
+        "parent-run",
+        Default::default(),
+        "provider unavailable",
+    );
+    if let Some(pb::agent_client_message::Message::RunRequest(request)) =
+        notification.message.as_mut()
+    {
+        if let Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) =
+            request
+                .action
+                .as_mut()
+                .and_then(|action| action.action.as_mut())
+        {
+            action.completions[0].status = pb::BackgroundTaskStatus::Error as i32;
+        }
+    }
+    drive_completion(&handle, notification).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let history = serde_json::to_string(&requests[0].history).unwrap();
+    assert!(history.contains("status: error"));
+    assert!(history.contains("agent_id: failed-child"));
+    assert!(history.contains("provider unavailable"));
+    assert!(!history.contains("status: success"));
+}
+
+#[tokio::test]
 async fn subagent_without_message_ids_can_start_and_continue_from_checkpoint() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();

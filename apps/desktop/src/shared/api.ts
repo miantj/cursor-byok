@@ -381,6 +381,10 @@ export interface LlmCall {
   call_id: string;
   run_id: string;
   conversation_id: string;
+  run_kind: "root" | "subagent" | null;
+  parent_run_id: string | null;
+  parent_tool_call_id: string | null;
+  subagent_kind: string | null;
   provider_call_index: number;
   model_hash: string | null;
   provider_type: string;

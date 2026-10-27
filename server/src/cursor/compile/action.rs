@@ -5,6 +5,28 @@ use crate::{
     model::{CanonicalMessage, RunId},
 };
 
+pub(crate) fn normalize_subagent_message(action: &mut pb::ConversationAction, message_id: &str) {
+    let user = match action.action.as_mut() {
+        Some(pb::conversation_action::Action::UserMessageAction(action)) => {
+            action.user_message.as_mut()
+        }
+        Some(pb::conversation_action::Action::InjectContextAction(action))
+            if !action.injection_id.is_empty() =>
+        {
+            match action.payload.as_mut() {
+                Some(pb::inject_context_action::Payload::UserContext(context)) => {
+                    context.user_message.as_mut()
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(user) = user.filter(|user| user.message_id.is_empty()) {
+        user.message_id = message_id.into();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageDelivery {
     Ignore,

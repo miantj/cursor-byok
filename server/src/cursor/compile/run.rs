@@ -12,6 +12,7 @@ use crate::{
         services::blob_sync::BlobSynchronizer,
         services::context_sync::RequestContextSynchronizer,
         tools::runtime::{ExecContext, SubagentModel},
+        transport::TransportParent,
     },
     model::{
         CanonicalMessage, ContentPart, ConversationId, MessageContent, Origin, PreparedRun,
@@ -37,6 +38,7 @@ struct ActionProjection {
 pub struct CursorRunContext {
     pub request_id: String,
     pub mode: i32,
+    pub runtime_mode: Mode,
     pub turn_user: Option<pb::UserMessage>,
     pub exec: ExecContext,
     pub dynamic_tools: BTreeMap<String, pb::McpToolDefinition>,
@@ -52,6 +54,7 @@ pub(crate) struct PrepareDependencies<'a> {
     pub blob_sync: &'a BlobSynchronizer,
     pub context_sync: &'a RequestContextSynchronizer,
     pub local_rules_dir: Option<&'a std::path::Path>,
+    pub parent: Option<&'a TransportParent>,
 }
 
 pub(crate) async fn prepare(
@@ -66,6 +69,7 @@ pub(crate) async fn prepare(
         blob_sync,
         context_sync,
         local_rules_dir,
+        parent,
     } = dependencies;
     checkpoint
         .import_prefetched(&request.pre_fetched_blobs)
@@ -77,6 +81,29 @@ pub(crate) async fn prepare(
             .unwrap_or_else(|| request_id.into()),
     );
     let run_id = execution_run_id(request_id);
+    let is_subagent = request.subagent_type_name.is_some() || parent.is_some();
+    let kind = if is_subagent {
+        let parent_run_id = match parent {
+            Some(parent) => {
+                store
+                    .subagent_parent_run(&parent.request_id, &parent.tool_call_id)
+                    .await?
+            }
+            None => None,
+        };
+        RunKind::Subagent {
+            parent_run_id,
+            parent_tool_call_id: parent.map(|parent| parent.tool_call_id.clone()),
+            kind: model::subagent_kind(
+                request
+                    .subagent_type_name
+                    .as_deref()
+                    .unwrap_or("generalPurpose"),
+            ),
+        }
+    } else {
+        RunKind::Root
+    };
     let mut base_messages = if request.conversation_state.is_some() {
         Some(
             checkpoint
@@ -133,8 +160,8 @@ pub(crate) async fn prepare(
         starts_turn,
         compacting,
         background_completion,
-    } = action(request_id, request)?;
-    let checkpoint_mode = if request.subagent_type_name.is_some() {
+    } = action(request_id, request, is_subagent)?;
+    let checkpoint_mode = if is_subagent {
         Mode::Subagent
     } else {
         mode_from_proto(mode_number)?
@@ -327,13 +354,14 @@ pub(crate) async fn prepare(
         &model.model_id,
         subagents_disabled,
         &subagent_model_overrides,
+        is_subagent,
     );
     Ok((
         PreparedRun {
             run_id,
             cursor_request_id: Some(request_id.into()),
             conversation_id,
-            kind: RunKind::Root,
+            kind,
             model,
             prompt,
             initial_messages,
@@ -343,6 +371,7 @@ pub(crate) async fn prepare(
         CursorRunContext {
             request_id: request_id.into(),
             mode: mode_number,
+            runtime_mode: checkpoint_mode,
             turn_user,
             exec,
             dynamic_tools: dynamic
@@ -399,7 +428,11 @@ fn execution_run_id(request_id: &str) -> RunId {
     RunId::new(format!("{request_id}:{}", &execution_id[..8]))
 }
 
-fn action(request_id: &str, request: &pb::AgentRunRequest) -> Result<ActionProjection> {
+fn action(
+    request_id: &str,
+    request: &pb::AgentRunRequest,
+    is_subagent: bool,
+) -> Result<ActionProjection> {
     let conversation_mode = request
         .conversation_state
         .as_ref()
@@ -427,7 +460,7 @@ fn action(request_id: &str, request: &pb::AgentRunRequest) -> Result<ActionProje
                 Error::Protocol("Cursor user message action has no UserMessage".into())
             })?;
             // Cursor subagent actions can omit message IDs; keep their identity stable across request retries.
-            if user.message_id.is_empty() && request.subagent_type_name.is_some() {
+            if user.message_id.is_empty() && is_subagent {
                 user.message_id = format!("subagent:{request_id}");
             }
             let mode = if user.mode == pb::AgentMode::Unspecified as i32 {
@@ -589,6 +622,7 @@ fn exec_context(
         crate::model::SubagentKind,
         crate::model::SubagentModelOverride,
     )],
+    is_subagent: bool,
 ) -> ExecContext {
     let subagent_model = overrides.first().map(|(_, value)| match value {
         crate::model::SubagentModelOverride::Explicit(model) => {
@@ -605,7 +639,7 @@ fn exec_context(
             .unwrap_or_else(|| conversation_id.to_string()),
         default_subagent_model: model_id.into(),
         subagent_model,
-        allow_subagents: request.subagent_type_name.is_none() && !subagents_disabled,
+        allow_subagents: !is_subagent && !subagents_disabled,
         subagents_disabled,
         terminals_folder: request_context
             .env
@@ -644,9 +678,9 @@ mod tests {
     #[test]
     fn missing_subagent_message_id_is_stable_per_request() {
         let request = user_request("", true);
-        let first = action("child-request", &request).unwrap();
-        let retry = action("child-request", &request).unwrap();
-        let continuation = action("next-child-request", &request).unwrap();
+        let first = action("child-request", &request, true).unwrap();
+        let retry = action("child-request", &request, true).unwrap();
+        let continuation = action("next-child-request", &request, true).unwrap();
         let user = first.turn_user.unwrap();
         assert!(!user.message_id.is_empty());
         assert_eq!(user.message_id, retry.turn_user.unwrap().message_id);
@@ -658,14 +692,14 @@ mod tests {
     #[test]
     fn regular_user_message_still_requires_message_id() {
         assert!(matches!(
-            action("root-request", &user_request("", false)),
+            action("root-request", &user_request("", false), false),
             Err(Error::Protocol(message)) if message == "Cursor user message action has no message_id"
         ));
     }
 
     #[test]
     fn supplied_subagent_message_id_is_preserved() {
-        let projection = action("child-request", &user_request("client-id", true)).unwrap();
+        let projection = action("child-request", &user_request("client-id", true), true).unwrap();
         assert_eq!(projection.turn_user.unwrap().message_id, "client-id");
         assert_eq!(
             projection.input_id.as_deref(),

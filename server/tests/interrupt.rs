@@ -773,6 +773,15 @@ async fn runtime_user_message_action_interrupts_and_continues_with_new_message()
 
 #[tokio::test]
 async fn runtime_user_message_reports_delivered_and_appended() {
+    assert_runtime_user_message_delivery(false).await;
+}
+
+#[tokio::test]
+async fn subagent_follow_up_without_message_id_is_delivered_once_in_the_same_run() {
+    assert_runtime_user_message_delivery(true).await;
+}
+
+async fn assert_runtime_user_message_delivery(subagent: bool) {
     // A runtime user message is queued into `pending_injections` under a
     // `user-message:{id}` key, but the commit correlation only handled the
     // `inject-context:` prefix, so the entry was never cleared: the client
@@ -789,7 +798,7 @@ async fn runtime_user_message_reports_delivered_and_appended() {
     )
     .unwrap();
     let registry = TransportRegistry::new(
-        store,
+        store.clone(),
         Arc::new(provider.clone()),
         PromptCompiler::new(assets),
     );
@@ -798,13 +807,26 @@ async fn runtime_user_message_reports_delivered_and_appended() {
         .await
         .unwrap();
     let mut output = handle.subscribe();
+    let mut initial = client_run_for(
+        "user-message-events-request",
+        "user-message-events-conversation",
+    );
+    if let Some(pb::agent_client_message::Message::RunRequest(request)) = initial.message.as_mut() {
+        request.subagent_type_name = subagent.then(|| "explore".into());
+        if subagent {
+            if let Some(pb::conversation_action::Action::UserMessageAction(action)) = request
+                .action
+                .as_mut()
+                .and_then(|action| action.action.as_mut())
+            {
+                action.user_message.as_mut().unwrap().mode = pb::AgentMode::Unspecified as i32;
+            }
+        }
+    }
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for(
-                "user-message-events-request",
-                "user-message-events-conversation",
-            )),
+            message: Box::new(initial),
         })
         .await
         .unwrap();
@@ -822,13 +844,30 @@ async fn runtime_user_message_reports_delivered_and_appended() {
             acknowledge_kv(&handle, &mut append_seqno, &frame).await;
         }
     }
-    handle
-        .command(TransportCommand::Append {
-            seqno: append_seqno,
-            message: Box::new(runtime_user_message()),
-        })
-        .await
-        .unwrap();
+    let mut follow_up = runtime_user_message();
+    let expected_id = if subagent {
+        if let Some(pb::agent_client_message::Message::ConversationAction(action)) =
+            follow_up.message.as_mut()
+        {
+            if let Some(pb::conversation_action::Action::UserMessageAction(action)) =
+                action.action.as_mut()
+            {
+                action.user_message.as_mut().unwrap().message_id.clear();
+            }
+        }
+        format!("subagent:user-message-events-request:{append_seqno}")
+    } else {
+        "queued-user".into()
+    };
+    for _ in 0..2 {
+        handle
+            .command(TransportCommand::Append {
+                seqno: append_seqno,
+                message: Box::new(follow_up.clone()),
+            })
+            .await
+            .unwrap();
+    }
     append_seqno += 1;
 
     let mut protocol_events = Vec::new();
@@ -846,7 +885,7 @@ async fn runtime_user_message_reports_delivered_and_appended() {
         if let Some(pb::agent_server_message::Message::InteractionUpdate(update)) = server.message {
             match update.message {
                 Some(pb::interaction_update::Message::ContextInjectionState(update)) => {
-                    assert_eq!(update.injection_id, "user-message:queued-user");
+                    assert_eq!(update.injection_id, format!("user-message:{expected_id}"));
                     match update.state.and_then(|state| state.state) {
                         Some(pb::context_injection_state::State::Queued(_)) => {
                             protocol_events.push("queued")
@@ -861,7 +900,7 @@ async fn runtime_user_message_reports_delivered_and_appended() {
                 }
                 Some(pb::interaction_update::Message::UserMessageAppended(update)) => {
                     let user = update.user_message.expect("appended user message");
-                    assert_eq!(user.message_id, "queued-user");
+                    assert_eq!(user.message_id, expected_id);
                     assert_eq!(user.text, "queued follow-up");
                     protocol_events.push("user_message_appended");
                 }
@@ -885,6 +924,35 @@ async fn runtime_user_message_reports_delivered_and_appended() {
             "continued_output"
         ]
     );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].history,
+        requests[1].history[..requests[0].history.len()]
+    );
+    assert_eq!(
+        serde_json::to_string(&requests[1].history)
+            .unwrap()
+            .matches("queued follow-up")
+            .count(),
+        1
+    );
+    if subagent {
+        let history = serde_json::to_string(&requests[1].history).unwrap();
+        assert_eq!(
+            history
+                .matches("You are currently working inside a Task subagent.")
+                .count(),
+            2
+        );
+    }
+    let statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM runs WHERE cursor_request_id = ?")
+            .bind("user-message-events-request")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(statuses, ["completed"]);
 }
 
 #[tokio::test]

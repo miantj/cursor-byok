@@ -745,7 +745,7 @@ async fn new_task_result_exposes_the_subagent_name_and_id_to_the_model() {
 
     assert_eq!(
         completion.result().content,
-        "Subagent name: Analyze game logic\nSubagent ID: child-id"
+        "Subagent name: Analyze game logic\nSubagent ID: child-id\nStatus: running\nThe subagent has started. Wait for its completion notification before treating this task as finished."
     );
     let Some(pb::tool_call::Tool::TaskToolCall(tool)) = &completion.tool_call().tool else {
         panic!("expected TaskToolCall")
@@ -822,6 +822,42 @@ async fn unknown_exec_id_is_ignored() {
     .await
     .unwrap();
     assert!(matches!(result, codec::ClientExecEvent::Pending));
+}
+
+#[tokio::test]
+async fn running_subagent_follow_up_is_reported_as_not_delivered() {
+    let pending = CursorToolRuntime::default();
+    let mut task = call("resume-task", "Task");
+    task.arguments =
+        json!({"resume": "child-id", "prompt": "updated requirement", "model": "inherit"});
+    let prepared = exec_context().prepare_call(&task).unwrap();
+    assert!(prepared.arguments.get("subagent_type").is_none());
+    let id = pending
+        .reserve_exec(&prepared, &exec_context())
+        .await
+        .unwrap();
+    let event = codec::client_event(&pb::ExecClientMessage {
+        id,
+        message: Some(pb::exec_client_message::Message::SubagentResult(pb::SubagentResult {
+            result: Some(pb::subagent_result::Result::Error(pb::SubagentError {
+                error: "Sub-agent is currently running. You may send the follow-up message when it has completed.".into(),
+                ..Default::default()
+            })),
+        })),
+        ..Default::default()
+    }, &pending).await.unwrap();
+    let codec::ClientExecEvent::Completed(completion) = event else {
+        panic!("expected Task error")
+    };
+    assert!(completion.result().is_error);
+    assert!(completion
+        .result()
+        .content
+        .contains("This follow-up was not delivered"));
+    assert!(completion
+        .result()
+        .content
+        .contains("user explicitly authorizes"));
 }
 
 #[tokio::test]

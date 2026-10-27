@@ -16,10 +16,9 @@ pub enum SubagentKind {
 pub enum RunKind {
     Root,
     Subagent {
-        parent_run_id: RunId,
-        parent_tool_call_id: String,
+        parent_run_id: Option<RunId>,
+        parent_tool_call_id: Option<String>,
         kind: SubagentKind,
-        background: bool,
     },
 }
 

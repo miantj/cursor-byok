@@ -190,13 +190,7 @@ pub(super) fn task(
     use pb::{subagent_result::Result as Input, task_result::Result as Output};
     let result = match result.result.as_ref() {
         Some(Input::Success(value)) => {
-            let is_background = value.background_reason
-                != pb::SubagentBackgroundReason::Unspecified as i32
-                || call
-                    .arguments
-                    .get("run_in_background")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true);
+            let is_background = super::task_is_background(value, call);
             Output::Success(pb::TaskSuccess {
                 agent_id: Some(value.agent_id.clone()),
                 is_background,

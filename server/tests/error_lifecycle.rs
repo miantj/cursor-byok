@@ -605,6 +605,7 @@ async fn parent_request_does_not_need_to_resolve_to_an_active_run() {
             tool_call_id: "original-tool-call".into(),
         }),
         None,
+        false,
     )
     .await;
 }
@@ -615,6 +616,21 @@ async fn subagent_type_does_not_require_parent_metadata() {
         "parentless-subagent-request",
         None,
         Some("generalPurpose"),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn subagent_keeps_the_exact_completed_parent_run_and_task_call() {
+    assert_run_starts_without_parent_dependency(
+        "linked-child-request",
+        Some(TransportParent {
+            request_id: "parent-request".into(),
+            tool_call_id: "original-tool-call".into(),
+        }),
+        Some("explore"),
+        true,
     )
     .await;
 }
@@ -623,8 +639,25 @@ async fn assert_run_starts_without_parent_dependency(
     request_id: &str,
     parent: Option<TransportParent>,
     subagent_type_name: Option<&str>,
+    recorded_parent: bool,
 ) {
     let (_directory, store) = fixtures::temp_store().await;
+    if recorded_parent {
+        let checkpoint = store
+            .ensure_conversation(&cursor_server::model::ConversationId::new(
+                "parent-conversation",
+            ))
+            .await
+            .unwrap();
+        for (run_id, timestamp) in [("original-parent-run", 1_i64), ("newer-parent-run", 2)] {
+            sqlx::query("INSERT INTO runs (run_id, cursor_request_id, conversation_id, base_checkpoint_id, head_checkpoint_id, run_kind, status, created_at_ms, updated_at_ms) VALUES (?, 'parent-request', 'parent-conversation', ?, ?, 'root', 'completed', ?, ?)")
+                .bind(run_id).bind(checkpoint.0).bind(checkpoint.0).bind(timestamp).bind(timestamp).execute(store.pool()).await.unwrap();
+        }
+        sqlx::query("INSERT INTO tool_rounds (round_id, run_id, base_checkpoint_id, assistant_json, status, created_at_ms, updated_at_ms) VALUES ('parent-round', 'original-parent-run', ?, '{}', 'settled', 1, 1)")
+            .bind(checkpoint.0).execute(store.pool()).await.unwrap();
+        sqlx::query(r#"INSERT INTO tool_round_calls (round_id, call_index, call_id, model_call_id, name, arguments_json, status) VALUES ('parent-round', 0, 'original-tool-call', 'parent-model', 'Task', '{"run_in_background":true}', 'completed')"#)
+            .execute(store.pool()).await.unwrap();
+    }
     let provider = fake_provider::FakeProvider::default();
     provider.push(vec![
         ModelEvent::Start {
@@ -651,7 +684,14 @@ async fn assert_run_starts_without_parent_dependency(
         handle.set_parent(parent).unwrap();
     }
     let mut output = handle.subscribe();
-    let mut message = protocol_client_run("continue", "independent-user");
+    let mut message = protocol_client_run(
+        "continue",
+        if handle.parent().is_some() {
+            ""
+        } else {
+            "independent-user"
+        },
+    );
     let Some(pb::agent_client_message::Message::RunRequest(request)) = message.message.as_mut()
     else {
         unreachable!()
@@ -698,7 +738,14 @@ async fn assert_run_starts_without_parent_dependency(
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("root".into(), None, None));
+    assert_eq!(
+        row,
+        (
+            "subagent".into(),
+            recorded_parent.then(|| "original-parent-run".into()),
+            handle.parent().map(|parent| parent.tool_call_id.clone()),
+        )
+    );
 }
 
 fn client_run() -> pb::AgentClientMessage {

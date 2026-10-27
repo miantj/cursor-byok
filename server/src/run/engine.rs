@@ -38,7 +38,7 @@ impl RunEngine {
 
     #[tracing::instrument(
         skip_all,
-        fields(run_id = %prepared.run_id, conversation_id = %prepared.conversation_id)
+        fields(run_id = %prepared.run_id, conversation_id = %prepared.conversation_id, kind = ?prepared.kind)
     )]
     pub async fn run(
         &self,

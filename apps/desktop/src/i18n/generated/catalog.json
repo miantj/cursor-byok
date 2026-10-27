@@ -175,7 +175,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 71,
+          "line": 75,
           "column": 54
         }
       ]
@@ -328,12 +328,12 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 28,
+          "line": 32,
           "column": 61
         },
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 45,
+          "line": 49,
           "column": 42
         },
         {
@@ -384,7 +384,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 43,
+          "line": 47,
           "column": 6
         },
         {
@@ -587,6 +587,18 @@
           "file": "features/models/CursorModelEditor.tsx",
           "line": 159,
           "column": 322
+        }
+      ]
+    },
+    "14d614e81c9d957d": {
+      "source": "任务类型",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/calls/CallDetails.tsx",
+          "line": 19,
+          "column": 6
         }
       ]
     },
@@ -957,6 +969,18 @@
         }
       ]
     },
+    "234b399d0e8f9a09": {
+      "source": "父工具调用 ID",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/calls/CallDetails.tsx",
+          "line": 21,
+          "column": 6
+        }
+      ]
+    },
     "23ae7a90b1b9816d": {
       "source": "清理范围",
       "kind": "text",
@@ -1220,7 +1244,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 45,
+          "line": 49,
           "column": 6
         },
         {
@@ -1287,7 +1311,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 24,
+          "line": 28,
           "column": 6
         }
       ]
@@ -1510,7 +1534,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 54,
+          "line": 58,
           "column": 32
         }
       ]
@@ -1539,7 +1563,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 63,
+          "line": 67,
           "column": 39
         }
       ]
@@ -1775,12 +1799,12 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 56,
+          "line": 60,
           "column": 39
         },
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 63,
+          "line": 67,
           "column": 68
         }
       ]
@@ -1820,6 +1844,18 @@
           "file": "features/models/CursorSettingsPage.tsx",
           "line": 162,
           "column": 27
+        }
+      ]
+    },
+    "4629b76e023ab320": {
+      "source": "子任务",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/calls/CallDetails.tsx",
+          "line": 19,
+          "column": 78
         }
       ]
     },
@@ -2587,7 +2623,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 51,
+          "line": 55,
           "column": 29
         }
       ]
@@ -2613,7 +2649,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 29,
+          "line": 33,
           "column": 6
         },
         {
@@ -2678,7 +2714,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 532,
+          "line": 536,
           "column": 43
         }
       ]
@@ -2745,7 +2781,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 44,
+          "line": 48,
           "column": 6
         },
         {
@@ -3017,7 +3053,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 527,
+          "line": 531,
           "column": 43
         }
       ]
@@ -3195,7 +3231,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 461,
+          "line": 465,
           "column": 21
         }
       ]
@@ -3663,6 +3699,18 @@
         }
       ]
     },
+    "95cb8b370ebc3b73": {
+      "source": "主任务",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/calls/CallDetails.tsx",
+          "line": 19,
+          "column": 89
+        }
+      ]
+    },
     "966498853d801a52": {
       "source": "TAB 选择",
       "kind": "text",
@@ -3790,7 +3838,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 27,
+          "line": 31,
           "column": 6
         },
         {
@@ -4113,7 +4161,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 59,
+          "line": 63,
           "column": 44
         }
       ]
@@ -4271,7 +4319,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 26,
+          "line": 30,
           "column": 6
         },
         {
@@ -4512,7 +4560,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 21,
+          "line": 25,
           "column": 6
         }
       ]
@@ -4550,12 +4598,12 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 28,
+          "line": 32,
           "column": 52
         },
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 45,
+          "line": 49,
           "column": 33
         },
         {
@@ -4753,12 +4801,12 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 69,
+          "line": 73,
           "column": 62
         },
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 74,
+          "line": 78,
           "column": 20
         }
       ]
@@ -4890,12 +4938,12 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 58,
+          "line": 62,
           "column": 14
         },
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 58,
+          "line": 62,
           "column": 51
         }
       ]
@@ -5054,12 +5102,12 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 57,
+          "line": 61,
           "column": 14
         },
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 57,
+          "line": 61,
           "column": 51
         }
       ]
@@ -5420,6 +5468,18 @@
         }
       ]
     },
+    "dd849d31fd35e7be": {
+      "source": "父任务 Run ID",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/calls/CallDetails.tsx",
+          "line": 20,
+          "column": 6
+        }
+      ]
+    },
     "ddde16f8839da3ce": {
       "source": "总请求",
       "kind": "text",
@@ -5509,12 +5569,12 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 61,
+          "line": 65,
           "column": 33
         },
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 64,
+          "line": 68,
           "column": 32
         }
       ]
@@ -5600,7 +5660,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 19,
+          "line": 23,
           "column": 6
         }
       ]
@@ -5780,7 +5840,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 33,
+          "line": 37,
           "column": 6
         },
         {
@@ -5862,7 +5922,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 22,
+          "line": 26,
           "column": 6
         }
       ]
@@ -5914,6 +5974,18 @@
           "file": "features/settings/PricingSettingsCard.tsx",
           "line": 33,
           "column": 21
+        }
+      ]
+    },
+    "ecf6c32da7bb36bc": {
+      "source": "子代理类型",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/calls/CallDetails.tsx",
+          "line": 22,
+          "column": 6
         }
       ]
     },
@@ -6008,7 +6080,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 23,
+          "line": 27,
           "column": 6
         }
       ]
@@ -6200,7 +6272,7 @@
       "refs": [
         {
           "file": "features/calls/CallDetails.tsx",
-          "line": 65,
+          "line": 69,
           "column": 44
         }
       ]

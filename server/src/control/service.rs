@@ -801,6 +801,10 @@ fn official_call(trace: CursorRunTraceSummary) -> CallSummary {
                 .conversation_id
                 .clone()
                 .unwrap_or_else(|| trace.request_id.clone()),
+            run_kind: None,
+            parent_run_id: None,
+            parent_tool_call_id: None,
+            subagent_kind: None,
             provider_call_index: 0,
             model_hash: None,
             provider_type: "cursor-official".into(),

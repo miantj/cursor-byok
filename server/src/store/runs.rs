@@ -36,6 +36,26 @@ pub struct ClaimedRun {
 }
 
 impl Store {
+    pub(crate) async fn subagent_parent_run(
+        &self,
+        parent_request_id: &str,
+        parent_tool_call_id: &str,
+    ) -> Result<Option<RunId>> {
+        let run_id: Option<String> = sqlx::query_scalar(
+            "SELECT r.run_id
+             FROM runs r
+             JOIN tool_rounds tr ON tr.run_id = r.run_id
+             JOIN tool_round_calls t ON t.round_id = tr.round_id
+             WHERE r.cursor_request_id = ? AND t.call_id = ? AND lower(t.name) = 'task'
+             ORDER BY tr.created_at_ms DESC, tr.round_id DESC LIMIT 1",
+        )
+        .bind(parent_request_id)
+        .bind(parent_tool_call_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(run_id.map(RunId::new))
+    }
+
     pub async fn claim_run(&self, prepared: &PreparedRun) -> Result<ClaimedRun> {
         let _write = self.writes.lock().await;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -262,10 +282,9 @@ fn run_kind_columns(kind: &RunKind) -> (Option<&str>, Option<&str>, &'static str
             parent_run_id,
             parent_tool_call_id,
             kind,
-            ..
         } => (
-            Some(parent_run_id.as_str()),
-            Some(parent_tool_call_id.as_str()),
+            parent_run_id.as_ref().map(RunId::as_str),
+            parent_tool_call_id.as_deref(),
             "subagent",
             Some(match kind {
                 crate::model::SubagentKind::GeneralPurpose => "generalPurpose".into(),

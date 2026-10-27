@@ -8,6 +8,19 @@ use crate::{
 
 use super::{now_ms, Store};
 
+const SUMMARY_COLUMNS: &str = "c.call_id, c.run_id, c.conversation_id, c.provider_call_index,
+    c.model_hash, c.provider_type, c.provider_url, c.request_type,
+    c.request_url, c.model_id, c.display_name, c.status,
+    c.finish_reason, c.created_at_ms, c.request_started_at_ms, c.response_headers_at_ms,
+    c.first_event_at_ms, c.first_text_at_ms, c.finished_at_ms, c.queue_ms,
+    c.ttfb_ms, c.ttft_ms, c.duration_ms, c.input_tokens,
+    c.output_tokens, c.total_tokens, c.cache_read_tokens, c.cache_write_tokens,
+    c.reasoning_tokens, c.usage_json, c.message_count, c.tool_count,
+    c.request_bytes, c.response_bytes, c.stream_event_count, c.http_status,
+    c.error_kind, c.error_message, c.detailed, c.reasoning_effort,
+    c.fast, c.first_valid_response_at_ms, c.ttfr_ms, r.run_kind,
+    r.parent_run_id, r.parent_tool_call_id, r.subagent_kind";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContextUsageAnchor {
     pub(crate) context_input_tokens: u64,
@@ -304,7 +317,7 @@ impl Store {
     }
 
     pub async fn llm_calls(&self, limit: i64) -> Result<Vec<LlmCallSummary>> {
-        let rows = sqlx::query("SELECT * FROM llm_calls ORDER BY created_at_ms DESC LIMIT ?")
+        let rows = sqlx::query(&format!("SELECT {SUMMARY_COLUMNS} FROM llm_calls c LEFT JOIN runs r ON r.run_id = c.run_id ORDER BY c.created_at_ms DESC LIMIT ?"))
             .bind(limit.clamp(1, 500))
             .fetch_all(&self.pool)
             .await?;
@@ -312,7 +325,7 @@ impl Store {
     }
 
     pub async fn llm_call(&self, call_id: &str) -> Result<Option<LlmCallSummary>> {
-        sqlx::query("SELECT * FROM llm_calls WHERE call_id = ?")
+        sqlx::query(&format!("SELECT {SUMMARY_COLUMNS} FROM llm_calls c LEFT JOIN runs r ON r.run_id = c.run_id WHERE c.call_id = ?"))
             .bind(call_id)
             .fetch_optional(&self.pool)
             .await?
@@ -365,6 +378,10 @@ fn summary_from_row(row: sqlx::sqlite::SqliteRow) -> Result<LlmCallSummary> {
         call_id: row.try_get("call_id")?,
         run_id: row.try_get("run_id")?,
         conversation_id: row.try_get("conversation_id")?,
+        run_kind: row.try_get("run_kind")?,
+        parent_run_id: row.try_get("parent_run_id")?,
+        parent_tool_call_id: row.try_get("parent_tool_call_id")?,
+        subagent_kind: row.try_get("subagent_kind")?,
         provider_call_index: row.try_get("provider_call_index")?,
         model_hash: row.try_get("model_hash")?,
         provider_type: row.try_get("provider_type")?,
@@ -415,6 +432,55 @@ mod tests {
     use super::*;
     use crate::model::ProviderType;
 
+    #[tokio::test]
+    async fn summaries_expose_subagent_parents_without_detailed_logging() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        let checkpoint = store
+            .ensure_conversation(&crate::model::ConversationId::new("child-conversation"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO runs (run_id, conversation_id, base_checkpoint_id, head_checkpoint_id, run_kind, parent_run_id, parent_tool_call_id, subagent_kind, status, created_at_ms, updated_at_ms) VALUES ('child-run', 'child-conversation', ?, ?, 'subagent', 'parent-run', 'parent-task', 'explore', 'completed', 1, 1)")
+            .bind(checkpoint.0).bind(checkpoint.0).execute(store.pool()).await.unwrap();
+        store
+            .start_llm_call(&NewLlmCall {
+                call_id: "child-call".into(),
+                run_id: "child-run".into(),
+                conversation_id: "child-conversation".into(),
+                provider_call_index: 0,
+                model_hash: "plugin:model".into(),
+                provider_type: ProviderType::Plugin,
+                provider_url: "plugin://model".into(),
+                request_type: ProviderType::Plugin,
+                request_url: "plugin://model".into(),
+                model_id: "test".into(),
+                display_name: "Test".into(),
+                reasoning_effort: None,
+                fast: false,
+                message_count: 1,
+                tool_count: 0,
+                detailed: false,
+            })
+            .await
+            .unwrap();
+        let calls = [
+            store.llm_call("child-call").await.unwrap().unwrap(),
+            store.llm_calls(10).await.unwrap().remove(0),
+        ];
+        for call in calls {
+            assert_eq!(call.run_kind.as_deref(), Some("subagent"));
+            assert_eq!(call.parent_run_id.as_deref(), Some("parent-run"));
+            assert_eq!(call.parent_tool_call_id.as_deref(), Some("parent-task"));
+            assert_eq!(call.subagent_kind.as_deref(), Some("explore"));
+            assert!(!call.detailed);
+        }
+    }
+
     /// 插件模型不在 model_configs 中,调用记录必须照常落库并可按其稳定 ID 筛选。
     #[tokio::test]
     async fn plugin_calls_record_without_a_model_config_row() {
@@ -457,6 +523,9 @@ mod tests {
             .unwrap();
         assert_eq!(overview.metrics.llm_calls, 1);
         assert_eq!(overview.metrics.successful_calls, 1);
+        let call = store.llm_call("plugin-call").await.unwrap().unwrap();
+        assert!(call.run_kind.is_none());
+        assert_eq!(store.llm_calls(10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

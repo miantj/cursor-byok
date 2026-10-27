@@ -193,7 +193,22 @@ impl ConversationRuntime {
                         }
                     }
                     TransportCommand::Append { seqno, message } => {
-                        for (_seqno, message) in inbox.push(seqno, *message) {
+                        for (seqno, mut message) in inbox.push(seqno, *message) {
+                            if handle.parent().is_some()
+                                || current.as_ref().is_some_and(|generation| {
+                                    generation.request.subagent_type_name.is_some()
+                                })
+                            {
+                                if let Some(
+                                    pb::agent_client_message::Message::ConversationAction(action),
+                                ) = message.message.as_mut()
+                                {
+                                    compile::normalize_subagent_message(
+                                        action,
+                                        &format!("subagent:{}:{seqno}", handle.request_id()),
+                                    );
+                                }
+                            }
                             {
                                 match message.message {
                                     Some(pb::agent_client_message::Message::RunRequest(
@@ -660,6 +675,7 @@ fn spawn_run_request(
                     blob_sync: &blob_sync,
                     context_sync: &context_sync,
                     local_rules_dir: dependencies.local_rules_dir.as_deref(),
+                    parent: handle.parent(),
                 },
             ) => prepared,
         };

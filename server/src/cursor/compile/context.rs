@@ -557,9 +557,15 @@ fn prost_value(value: &prost_types::Value) -> Value {
     use prost_types::value::Kind;
     match value.kind.as_ref() {
         None | Some(Kind::NullValue(_)) => Value::Null,
-        Some(Kind::NumberValue(value)) => serde_json::Number::from_f64(*value)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        Some(Kind::NumberValue(value)) => {
+            // Protobuf stores all numbers as f64, but schema constraints need integer JSON tokens.
+            let integer = *value as i128;
+            let number = (integer as f64 == *value)
+                .then(|| serde_json::Number::from_i128(integer))
+                .flatten()
+                .or_else(|| serde_json::Number::from_f64(*value));
+            number.map(Value::Number).unwrap_or(Value::Null)
+        }
         Some(Kind::StringValue(value)) => Value::String(value.clone()),
         Some(Kind::BoolValue(value)) => Value::Bool(*value),
         Some(Kind::StructValue(value)) => Value::Object(
@@ -591,6 +597,75 @@ mod tests {
         pb::CursorRule {
             content: content.into(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mcp_protobuf_schema_preserves_integer_constraints() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "minLength": 1, "maxLength": 2048},
+                "items": {
+                    "type": "array",
+                    "minItems": 0,
+                    "maxItems": 10,
+                    "items": {"anyOf": [{"type": "string", "minLength": 1}]}
+                },
+                "ratio": {"type": "number", "minimum": -1, "multipleOf": 0.25}
+            }
+        });
+        let wire = prost_types::Value {
+            kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                fields: crate::cursor::tools::codec::json_object_to_prost(
+                    schema.as_object().unwrap(),
+                )
+                .into_iter()
+                .collect(),
+            })),
+        };
+        let context = pb::RequestContext {
+            tools: vec![pb::McpToolDefinition {
+                name: "user-lanhu-lanhu_design".into(),
+                input_schema: Some(wire.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tools = dynamic_mcp(&pb::AgentRunRequest::default(), &context).unwrap();
+        let (captured, definition) = tools.values().next().unwrap();
+        assert_eq!(captured.input_schema.as_ref(), Some(&wire));
+        assert_eq!(definition.parameters.to_string(), schema.to_string());
+        assert_eq!(
+            mcp_input_schema(&pb::McpToolDescriptor {
+                input_schema: Some(wire),
+                ..Default::default()
+            }),
+            Some(schema.to_string())
+        );
+    }
+
+    #[test]
+    fn protobuf_numbers_preserve_fractions_and_integer_boundaries() {
+        for (number, expected) in [
+            (0.0, serde_json::json!(0)),
+            (-0.0, serde_json::json!(0)),
+            (-1.0, serde_json::json!(-1)),
+            (0.25, serde_json::json!(0.25)),
+            (-0.25, serde_json::json!(-0.25)),
+            (i64::MIN as f64, serde_json::json!(i64::MIN)),
+            (i64::MAX as f64, serde_json::json!(1_u64 << 63)),
+            (u64::MAX as f64, serde_json::json!(u64::MAX as f64)),
+            (-1e100, serde_json::json!(-1e100)),
+            (1e100, serde_json::json!(1e100)),
+            (f64::NAN, Value::Null),
+            (f64::INFINITY, Value::Null),
+            (f64::NEG_INFINITY, Value::Null),
+        ] {
+            let value = prost_value(&prost_types::Value {
+                kind: Some(prost_types::value::Kind::NumberValue(number)),
+            });
+            assert_eq!(value.to_string(), expected.to_string(), "{number}");
         }
     }
 

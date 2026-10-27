@@ -854,7 +854,7 @@ impl ConversationOutput {
         let injection_id = format!("user-message:{}", user_message.message_id);
         let message = compile_user_message_action(
             &action,
-            self.context.mode,
+            self.context.runtime_mode,
             &self.compiler,
             &self.blob_sync,
         )
@@ -909,8 +909,13 @@ impl ConversationOutput {
             }
             _ => None,
         };
-        let message =
-            compile_injection(&action, self.context.mode, &self.compiler, &self.blob_sync).await?;
+        let message = compile_injection(
+            &action,
+            self.context.runtime_mode,
+            &self.compiler,
+            &self.blob_sync,
+        )
+        .await?;
         self.queue_injection(
             action.injection_id,
             user_message,

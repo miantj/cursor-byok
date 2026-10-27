@@ -426,10 +426,29 @@ fn task(value: &pb::SubagentResult, call: &ToolCall) -> Result<(String, bool)> {
                 .map_or(identity.clone(), |message| {
                     format!("{identity}\n\n{message}")
                 });
-            Ok((content, false))
+            Ok((task_status(content, value, call), false))
         }
         R::Success(value) => Ok((value.final_message.clone().unwrap_or_default(), false)),
-        R::Error(value) => Ok((value.error.clone(), true)),
+        R::Error(value) => {
+            let mut error = value.error.clone();
+            if error.contains("Sub-agent is currently running") {
+                error.push_str("\nThis follow-up was not delivered. Wait for the completion notification and then resume the same agent. Only set interrupt=true when the user explicitly authorizes interrupting that agent.");
+            }
+            Ok((error, true))
+        }
+    }
+}
+
+fn task_status(content: String, value: &pb::SubagentSuccess, call: &ToolCall) -> String {
+    if super::task_is_background(value, call) {
+        let status = "Status: running\nThe subagent has started. Wait for its completion notification before treating this task as finished.";
+        if content.is_empty() {
+            status.into()
+        } else {
+            format!("{content}\n{status}")
+        }
+    } else {
+        content
     }
 }
 
@@ -497,6 +516,37 @@ mod tests {
         let call = read_lints(json!(["a.ts"]));
         let (content, _) = output(&clean_result("a.ts"), &call).unwrap();
         assert_eq!(content, "No diagnostics found in a.ts");
+    }
+
+    #[test]
+    fn resumed_subagent_success_is_not_marked_running() {
+        let call = ToolCall {
+            index: 0,
+            call_id: "resume-task".into(),
+            model_call_id: "model:0".into(),
+            name: "Task".into(),
+            arguments_text: String::new(),
+            arguments: json!({
+                "resume": "child-id",
+                "prompt": "continue",
+                "run_in_background": true
+            }),
+            argument_error: None,
+        };
+        let (content, is_error) = output(
+            &pb::exec_client_message::Message::SubagentResult(pb::SubagentResult {
+                result: Some(pb::subagent_result::Result::Success(pb::SubagentSuccess {
+                    agent_id: "child-id".into(),
+                    final_message: Some("done".into()),
+                    background_reason: pb::SubagentBackgroundReason::UserRequest as i32,
+                    ..Default::default()
+                })),
+            }),
+            &call,
+        )
+        .unwrap();
+        assert!(!is_error);
+        assert_eq!(content, "done");
     }
 
     /// The notice belongs on a result that did report diagnostics too: those

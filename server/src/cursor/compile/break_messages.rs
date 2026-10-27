@@ -24,7 +24,7 @@ pub(crate) enum RuntimeAction {
 
 pub(crate) async fn compile_user_message_action(
     action: &pb::UserMessageAction,
-    current_mode: i32,
+    current_mode: Mode,
     compiler: &PromptCompiler,
     blobs: &BlobSynchronizer,
 ) -> Result<CanonicalMessage> {
@@ -37,10 +37,10 @@ pub(crate) async fn compile_user_message_action(
             "Cursor user message action has no message_id".into(),
         ));
     }
-    let mode = if user.mode == pb::AgentMode::Unspecified as i32 {
+    let mode = if current_mode == Mode::Subagent || user.mode == pb::AgentMode::Unspecified as i32 {
         current_mode
     } else {
-        user.mode
+        super::run::mode_from_proto(user.mode)?
     };
     let mut action_context = action
         .prepend_user_messages
@@ -58,7 +58,7 @@ pub(crate) async fn compile_user_message_action(
     let empty_context = pb::RequestContext::default();
     compile(
         format!("user-message:{}", user.message_id),
-        super::run::mode_from_proto(mode)?,
+        mode,
         user,
         action.request_context.as_ref().unwrap_or(&empty_context),
         &action_context.join("\\n\\n"),
@@ -70,7 +70,7 @@ pub(crate) async fn compile_user_message_action(
 
 pub(crate) async fn compile_injection(
     injection: &pb::InjectContextAction,
-    mode: i32,
+    mode: Mode,
     compiler: &PromptCompiler,
     blobs: &BlobSynchronizer,
 ) -> Result<CanonicalMessage> {
@@ -93,7 +93,7 @@ pub(crate) async fn compile_injection(
             let empty_context = pb::RequestContext::default();
             compile(
                 event_id,
-                super::run::mode_from_proto(mode)?,
+                mode,
                 user,
                 context.request_context.as_ref().unwrap_or(&empty_context),
                 "",
