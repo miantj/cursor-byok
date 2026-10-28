@@ -1,7 +1,10 @@
+import { spawn } from "node:child_process";
 import { codeInspectorPlugin } from "code-inspector-plugin";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { staticI18nPlugin } from "./plugins/static-i18n-plugin.ts";
+
+const DEV_PAGE = "http://127.0.0.1:3000/__byok-api__/";
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -19,6 +22,7 @@ export default defineConfig(async ({ command }) => ({
           ...(process.platform === "darwin" ? { launchType: "open" as const } : {}),
         })]
       : []),
+    ...(command === "serve" && process.env.CURSOR_OPEN_DEV_PAGE === "1" ? [openDevPagePlugin()] : []),
     react(),
   ],
 
@@ -44,3 +48,35 @@ export default defineConfig(async ({ command }) => ({
     },
   },
 }));
+
+function openDevPagePlugin(): Plugin {
+  return {
+    name: "open-dev-page",
+    configureServer(server) {
+      server.httpServer?.once("listening", () => {
+        void openWhenReady(DEV_PAGE);
+      });
+    },
+  };
+}
+
+async function openWhenReady(url: string) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      if ((await fetch(url)).ok) {
+        openUrl(url);
+        return;
+      }
+    } catch {
+      // Proxy is not accepting connections yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  openUrl(url);
+}
+
+function openUrl(url: string) {
+  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  spawn(command, args, { stdio: "ignore", detached: true }).unref();
+}
