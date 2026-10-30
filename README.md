@@ -41,6 +41,7 @@ You can connect OpenAI- and Anthropic-compatible services, customize endpoints, 
 - **Agent workflows:** Keep tool calling, Skills, MCP, and multi-turn conversations available.
 - **Bugbot quota handling:** Local Bugbot reviews try Cursor first. An official usage-limit error before review work starts restarts the same task on the first configured BYOK model. Other errors and reviews already in progress are not replayed. BYOK provider charges apply.
 - **Session metrics:** Track token usage, cache hit rate, conversation turns, and estimated value.
+- **Storage cleanup:** Reclaim SQLite and WAL space after clearing statistics while preserving conversation history and model settings. Writes wait during reclamation; if a reader prevents WAL truncation, cleanup reports that records were deleted but space reclamation is incomplete and can be retried.
 - **Cross-platform:** Run on macOS, Windows, and Linux.
 
 ## Quick Start
