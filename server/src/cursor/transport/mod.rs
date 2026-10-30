@@ -1,11 +1,13 @@
 //! Owns request-ID-scoped upstream ordering and downstream transport.
 
+mod bugbot_replay;
 mod handle;
 mod inbox;
 mod lifecycle;
 mod output;
 mod registry;
 
+pub(crate) use bugbot_replay::*;
 pub use handle::*;
 pub use inbox::*;
 pub(crate) use lifecycle::*;

@@ -10,7 +10,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
     api::cursor::{
-        bidi,
+        bidi, bugbot_fallback,
         proxy::{self, CursorProxy},
         run_sse,
     },
@@ -23,10 +23,14 @@ use crate::{
             account, analytics, commit_message, compatibility, entitlement::FreeEntitlementCache,
             knowledge, model_catalog, server_config, tab,
         },
-        transport::{TransportParent, TransportRegistry},
+        transport::{BugbotReplay, TransportParent, TransportRegistry},
     },
     Result,
 };
+
+#[cfg(test)]
+#[path = "bugbot_tests.rs"]
+mod bugbot_tests;
 
 pub fn router(
     registry: TransportRegistry,
@@ -213,14 +217,14 @@ async fn run_sse_handler(
                 Request::from_parts(parts, Body::from(body)),
             )
             .await?;
-            Ok(run_sse::upstream(
+            run_sse::upstream(
                 registry,
                 request.request_id,
                 generation,
                 response,
                 Some(trace),
             )
-            .await)
+            .await
         }
     }
 }
@@ -237,9 +241,14 @@ async fn bidi_handler(
     let conversation_id = decoded.conversation_id().map(str::to_owned);
     let trace_metadata = decoded.trace_metadata();
     let trace = registry.trace(&decoded.request_id);
+    let local_bugbot = matches!(&decoded.message.message,
+        Some(agent::agent_client_message::Message::RunRequest(request))
+            if request.subagent_type_name.as_deref() == Some("bugbot"))
+        && registry.local(&decoded.request_id).await.is_some();
     let local = if let Some(model_id) = decoded.model_id() {
         // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
-        if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
+        if local_bugbot
+            || model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
             || registry.store().model(model_id).await?.is_some()
         {
             tracing::info!(
@@ -260,6 +269,9 @@ async fn bidi_handler(
         true
     } else if registry.upstream(&decoded.request_id).await {
         false
+    } else if registry.local(&decoded.request_id).await.is_some() {
+        // The official stream may have handed off while the route was being read.
+        true
     } else {
         trace.resume();
         trace.request(
@@ -286,13 +298,40 @@ async fn bidi_handler(
     }
     if !local {
         if first_model.is_some() {
-            registry.mark_upstream(&decoded.request_id).await;
+            let mut replay = BugbotReplay::new(decoded.seqno, &decoded.message, None);
+            if let Some(replay) = &mut replay {
+                replay.parent = parent_headers(&parts.headers)?;
+            }
+            registry.mark_upstream(&decoded.request_id, replay).await;
         }
         trace.request(
             "bidi_request",
             body.clone(),
             trace_outcome(trace_metadata, true, "upstream", None),
         );
+        let replay = registry.bugbot_replay(&decoded.request_id).await;
+        if let Some((generation, replay)) = replay {
+            // Serialize appends with the handoff so no in-flight client message is lost.
+            let mut replay = replay.lock().await;
+            if replay.switched {
+                bidi::append(&registry, decoded, replay.parent.clone()).await?;
+                return Ok(bidi::append_response());
+            }
+            replay.record(decoded.seqno, &decoded.message);
+            let response = proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await?;
+            let (response, switched) =
+                bugbot_fallback::http_error(&registry, &decoded.request_id, response, &mut replay)
+                    .await?;
+            if switched {
+                registry.finish_upstream(decoded.request_id, generation);
+                return Ok(bidi::append_response());
+            }
+            return Ok(response);
+        }
         return proxy::forward(
             Extension(proxy),
             Request::from_parts(parts, Body::from(body)),
@@ -335,13 +374,7 @@ async fn bidi_handler(
             return Err(error);
         }
     }
-    let mut response = Response::new(axum::body::Body::empty());
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/proto"),
-    );
-    Ok(response)
+    Ok(bidi::append_response())
 }
 
 fn trace_outcome(

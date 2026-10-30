@@ -143,6 +143,10 @@ impl App {
         let address = listener.local_addr()?;
         self.registry.web_cache().set_service_addr(address);
         self.harness.set_backend_addr(address);
+        // Restore the proxy even when no management page requests its status.
+        if let Err(error) = self.harness.status().await {
+            tracing::warn!(%error, "failed to restore Cursor integration during startup");
+        }
         tracing::info!(%address, "cursor server listening");
         let registry = self.registry;
         let harness = self.harness;

@@ -8,6 +8,8 @@ use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
+use super::bugbot_fallback;
+
 use crate::{
     cursor::{
         protocol::connect::{self, END_STREAM_FLAG},
@@ -130,24 +132,97 @@ pub async fn upstream(
     generation: u64,
     response: Response<Body>,
     trace: Option<CursorTraceRecorder>,
-) -> Response<Body> {
-    let (parts, body) = response.into_parts();
+) -> Result<Response<Body>> {
+    let guard = UpstreamRunGuard {
+        registry: registry.clone(),
+        request_id: request_id.clone(),
+        generation,
+    };
+    let replay = registry
+        .bugbot_replay(&request_id)
+        .await
+        .filter(|(current, _)| *current == generation)
+        .map(|(_, replay)| replay);
+    let response = if let Some(replay) = &replay {
+        let (response, switched) = bugbot_fallback::http_error(
+            &registry,
+            &request_id,
+            response,
+            &mut *replay.lock().await,
+        )
+        .await?;
+        if switched {
+            return stream(&registry, &request_id).await;
+        }
+        response
+    } else {
+        response
+    };
+    let (mut parts, body) = response.into_parts();
+    if replay.is_some() {
+        parts.headers.remove(header::CONTENT_LENGTH);
+    }
     if let Some(trace) = &trace {
         trace.response_started(parts.status.as_u16());
     }
+    let inspect_quota = replay.is_some() && parts.status.is_success();
     let stream = async_stream::stream! {
-        let _guard = UpstreamRunGuard {
-            registry,
-            request_id,
-            generation,
-        };
+        let _guard = guard;
         let mut trace = TraceStreamSink::new(trace, "cursor_official");
         let mut body = body.into_data_stream();
+        let mut inspecting = inspect_quota;
+        let mut pending = bytes::BytesMut::new();
         while let Some(chunk) = body.next().await {
             match chunk {
                 Ok(chunk) => {
                     trace.chunk(&chunk);
-                    yield Ok::<Bytes, axum::Error>(chunk);
+                    if !inspecting {
+                        yield Ok::<Bytes, axum::Error>(chunk);
+                        continue;
+                    }
+                    pending.extend_from_slice(&chunk);
+                    while pending.len() >= 5 {
+                        let length = u32::from_be_bytes(pending[1..5].try_into().expect("Connect frame header")) as usize;
+                        if length > bugbot_fallback::MAX_ERROR_BYTES {
+                            inspecting = false;
+                            replay.as_ref().expect("replay exists").lock().await.appends = None;
+                            yield Ok(pending.split().freeze());
+                            break;
+                        }
+                        if pending.len() < 5 + length {break;}
+                        let frame = pending.split_to(5 + length).freeze();
+                        if frame[0] == END_STREAM_FLAG && bugbot_fallback::quota_error(&frame[5..]) {
+                            let switched = bugbot_fallback::start(&registry,&request_id,&mut *replay.as_ref().expect("replay exists").lock().await).await;
+                            match switched {
+                                Ok(true) => {
+                                    trace.handoff();
+                                    match stream(&registry,&request_id).await {
+                                        Ok(response) => {
+                                            let mut local = response.into_body().into_data_stream();
+                                            while let Some(chunk) = local.next().await {yield chunk;}
+                                        }
+                                        Err(error) => yield Err(axum::Error::new(error)),
+                                    }
+                                    return;
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    trace.finish(Some(error.to_string()));
+                                    yield Err(axum::Error::new(error));
+                                    return;
+                                }
+                            }
+                        }
+                        if !bugbot_fallback::heartbeat(&frame) {
+                            inspecting = false;
+                            replay.as_ref().expect("replay exists").lock().await.appends = None;
+                        }
+                        yield Ok(frame);
+                        if !inspecting {
+                            if !pending.is_empty() {yield Ok(pending.split().freeze());}
+                            break;
+                        }
+                    }
                 }
                 Err(error) => {
                     trace.finish(Some(error.to_string()));
@@ -156,14 +231,16 @@ pub async fn upstream(
                 }
             }
         }
+        if !pending.is_empty() {yield Ok(pending.freeze());}
         trace.finish(None);
     };
-    Response::from_parts(parts, Body::from_stream(stream))
+    Ok(Response::from_parts(parts, Body::from_stream(stream)))
 }
 
 enum TraceStreamEvent {
     Chunk(Bytes),
     Finish(Option<String>),
+    Handoff,
 }
 
 struct TraceStreamSink {
@@ -186,6 +263,7 @@ impl TraceStreamSink {
                         trace.finish(error.as_deref());
                         return;
                     }
+                    TraceStreamEvent::Handoff => return,
                 }
             }
             trace.finish(None);
@@ -204,6 +282,12 @@ impl TraceStreamSink {
     fn finish(&mut self, error: Option<String>) {
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(TraceStreamEvent::Finish(error));
+        }
+    }
+
+    fn handoff(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(TraceStreamEvent::Handoff);
         }
     }
 }

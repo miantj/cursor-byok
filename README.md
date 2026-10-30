@@ -39,6 +39,7 @@ You can connect OpenAI- and Anthropic-compatible services, customize endpoints, 
 - **Model management:** Add, duplicate, edit, reorder, and batch-test multiple model configurations.
 - **Connection benchmarks:** Measure time to first token, generation speed, and inspect raw provider responses.
 - **Agent workflows:** Keep tool calling, Skills, MCP, and multi-turn conversations available.
+- **Bugbot quota handling:** Local Bugbot reviews try Cursor first. An official usage-limit error before review work starts restarts the same task on the first configured BYOK model. Other errors and reviews already in progress are not replayed. BYOK provider charges apply.
 - **Session metrics:** Track token usage, cache hit rate, conversation turns, and estimated value.
 - **Cross-platform:** Run on macOS, Windows, and Linux.
 

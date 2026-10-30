@@ -209,3 +209,10 @@ pub async fn append(
         .await?;
     Ok(ai::BidiAppendResponse {})
 }
+
+pub(super) fn append_response() -> axum::http::Response<axum::body::Body> {
+    axum::http::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/proto")
+        .body(axum::body::Body::empty())
+        .expect("static append response")
+}

@@ -98,7 +98,11 @@ pub mod aiserver {
             #[repr(i32)]
             pub enum Error {
                 Unspecified = 0,
+                FreeUserUsageLimit = 9,
+                ProUserUsageLimit = 10,
                 CustomMessage = 29,
+                UsagePricingRequired = 44,
+                UsagePricingRequiredChangeable = 45,
                 ProviderError = 57,
                 Internal = 59,
             }

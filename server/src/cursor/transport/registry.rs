@@ -22,7 +22,7 @@ use crate::{
     Result,
 };
 
-use super::{OutputHub, TransportHandle};
+use super::{BugbotReplay, OutputHub, SharedBugbotReplay, TransportHandle};
 
 #[derive(Clone)]
 pub struct TransportRegistry {
@@ -32,7 +32,7 @@ pub struct TransportRegistry {
 struct RegistryInner {
     local: Mutex<HashMap<String, LocalTransport>>,
     next_local_generation: AtomicU64,
-    upstream: Mutex<HashMap<String, u64>>,
+    upstream: Mutex<HashMap<String, UpstreamTransport>>,
     route_changed: Notify,
     store: Store,
     traces: CursorTraceService,
@@ -45,6 +45,11 @@ struct RegistryInner {
 struct LocalTransport {
     generation: u64,
     handle: TransportHandle,
+}
+
+struct UpstreamTransport {
+    generation: u64,
+    bugbot_replay: Option<SharedBugbotReplay>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,16 +224,42 @@ impl TransportRegistry {
             .map(|transport| transport.handle.clone())
     }
 
-    pub async fn mark_upstream(&self, request_id: &str) {
+    pub(crate) async fn mark_upstream(&self, request_id: &str, replay: Option<BugbotReplay>) {
         let mut upstream = self.inner.upstream.lock().await;
-        let generation = upstream.get(request_id).copied().unwrap_or_default() + 1;
-        upstream.insert(request_id.into(), generation);
+        let generation = upstream
+            .get(request_id)
+            .map_or(0, |transport| transport.generation)
+            + 1;
+        upstream.insert(
+            request_id.into(),
+            UpstreamTransport {
+                generation,
+                bugbot_replay: replay.map(|replay| Arc::new(Mutex::new(replay))),
+            },
+        );
         drop(upstream);
         self.inner.route_changed.notify_waiters();
     }
 
     pub async fn upstream(&self, request_id: &str) -> bool {
         self.inner.upstream.lock().await.contains_key(request_id)
+    }
+
+    pub(crate) async fn bugbot_replay(
+        &self,
+        request_id: &str,
+    ) -> Option<(u64, SharedBugbotReplay)> {
+        self.inner
+            .upstream
+            .lock()
+            .await
+            .get(request_id)
+            .and_then(|transport| {
+                transport
+                    .bugbot_replay
+                    .clone()
+                    .map(|replay| (transport.generation, replay))
+            })
     }
 
     pub async fn wait_route(&self, request_id: &str) -> TransportRoute {
@@ -239,8 +270,8 @@ impl TransportRegistry {
             if self.inner.local.lock().await.contains_key(request_id) {
                 return TransportRoute::Local;
             }
-            if let Some(generation) = self.inner.upstream.lock().await.get(request_id).copied() {
-                return TransportRoute::Upstream(generation);
+            if let Some(transport) = self.inner.upstream.lock().await.get(request_id) {
+                return TransportRoute::Upstream(transport.generation);
             }
             changed.await;
         }
@@ -250,7 +281,10 @@ impl TransportRegistry {
         let registry = self.clone();
         tokio::spawn(async move {
             let mut upstream = registry.inner.upstream.lock().await;
-            if upstream.get(&request_id) == Some(&generation) {
+            if upstream
+                .get(&request_id)
+                .is_some_and(|transport| transport.generation == generation)
+            {
                 upstream.remove(&request_id);
             }
         });
