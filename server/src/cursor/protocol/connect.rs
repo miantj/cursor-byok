@@ -93,14 +93,37 @@ fn encode_end_stream_payload(payload: &[u8]) -> Bytes {
 }
 
 pub fn decode_unary<M: Message + Default>(body: &[u8]) -> Result<M> {
-    if body.len() >= 5 {
-        let flags = body[0];
-        let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-        if flags & END_STREAM_FLAG == 0 && length == body.len() - 5 {
-            return Ok(M::decode(&body[5..])?);
-        }
+    Ok(M::decode(unary_payload(body)?.1)?)
+}
+
+pub fn unary_payload(body: &[u8]) -> Result<(bool, &[u8])> {
+    if body.len() < 5 {
+        return Ok((false, body));
     }
-    Ok(M::decode(body)?)
+    let flags = body[0];
+    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    if length != body.len() - 5 {
+        return Ok((false, body));
+    }
+    if flags != 0 {
+        return Err(Error::Protocol(format!(
+            "unsupported unary Connect frame: flags={flags}"
+        )));
+    }
+    Ok((true, &body[5..]))
+}
+
+pub fn append_unary(body: &[u8], extra: &[u8]) -> Result<Bytes> {
+    let (framed, payload) = unary_payload(body)?;
+    let length = payload.len() + extra.len();
+    let mut output = BytesMut::with_capacity(usize::from(framed) * 5 + length);
+    if framed {
+        output.put_u8(0);
+        output.put_u32(length as u32);
+    }
+    output.extend_from_slice(payload);
+    output.extend_from_slice(extra);
+    Ok(output.freeze())
 }
 
 pub fn decode_frames(mut body: &[u8]) -> Result<Vec<(u8, Bytes)>> {
@@ -119,4 +142,24 @@ pub fn decode_frames(mut body: &[u8]) -> Result<Vec<(u8, Bytes)>> {
         body = &body[length..];
     }
     Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cursor::protocol::proto::agent::v1::BidiRequestId;
+
+    #[test]
+    fn unary_decode_rejects_compressed_and_terminal_frames() {
+        let mut frame = encode_message(&BidiRequestId {
+            request_id: "request".into(),
+        })
+        .unwrap()
+        .to_vec();
+        for flags in [1, END_STREAM_FLAG, 0x80] {
+            frame[0] = flags;
+            assert!(decode_unary::<BidiRequestId>(&frame).is_err());
+            assert!(append_unary(&frame, &[]).is_err());
+        }
+    }
 }

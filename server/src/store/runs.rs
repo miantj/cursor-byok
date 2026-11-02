@@ -2,7 +2,7 @@
 use sqlx::Row;
 
 use crate::{
-    model::{CheckpointId, ConversationId, PreparedRun, RunId, RunKind, Usage},
+    model::{CheckpointId, ConversationId, PreparedRun, RunId, RunKind, SubagentKind, Usage},
     Error, Result,
 };
 
@@ -36,6 +36,39 @@ pub struct ClaimedRun {
 }
 
 impl Store {
+    pub(crate) async fn latest_run_kind(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<RunKind>> {
+        let row = sqlx::query(
+            "SELECT run_kind, parent_run_id, parent_tool_call_id, subagent_kind
+             FROM runs WHERE conversation_id = ?
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+        )
+        .bind(conversation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| match row.try_get::<&str, _>("run_kind")? {
+            "root" => Ok(RunKind::Root),
+            "subagent" => {
+                let kind: String = row.try_get("subagent_kind")?;
+                Ok(RunKind::Subagent {
+                    parent_run_id: row
+                        .try_get::<Option<String>, _>("parent_run_id")?
+                        .map(RunId::new),
+                    parent_tool_call_id: row.try_get("parent_tool_call_id")?,
+                    kind: if kind == "generalPurpose" {
+                        SubagentKind::GeneralPurpose
+                    } else {
+                        SubagentKind::Named(kind)
+                    },
+                })
+            }
+            kind => Err(Error::Store(format!("unknown run kind: {kind}"))),
+        })
+        .transpose()
+    }
+
     pub(crate) async fn subagent_parent_run(
         &self,
         parent_request_id: &str,

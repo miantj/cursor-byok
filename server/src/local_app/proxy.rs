@@ -172,6 +172,7 @@ fn is_local_path(path: &str) -> bool {
             | "/aiserver.v1.AiService/GetDefaultModelForCli"
             | "/aiserver.v1.AiService/GetDefaultModel"
             | "/aiserver.v1.AiService/GetDefaultModelNudgeData"
+            | "/agent.v1.AgentService/GetNewChatNudgeParameterizedModelPicker"
             | "/aiserver.v1.AuthService/GetEmail"
             | "/aiserver.v1.AuthService/GetUserMeta"
             | "/aiserver.v1.DashboardService/GetMe"
@@ -208,6 +209,7 @@ mod tests {
             "/aiserver.v1.AiService/GetDefaultModelForCli",
             "/aiserver.v1.AiService/GetDefaultModel",
             "/aiserver.v1.AiService/GetDefaultModelNudgeData",
+            "/agent.v1.AgentService/GetNewChatNudgeParameterizedModelPicker",
             "/aiserver.v1.AiService/AvailableDocs",
             "/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
             "/aiserver.v1.DashboardService/GetUserPrivacyMode",

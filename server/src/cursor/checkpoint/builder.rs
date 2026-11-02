@@ -10,7 +10,10 @@ use crate::{
         services::blob_sync::BlobSynchronizer,
         transport::TransportHandle,
     },
-    model::{CanonicalMessage, ToolCall, ToolDefinition, ToolRoundAssistant},
+    model::{
+        CanonicalMessage, PreparedRun, PromptSpec, RunKind, ToolCall, ToolDefinition,
+        ToolRoundAssistant,
+    },
     store::Store,
     Result,
 };
@@ -39,13 +42,12 @@ impl CheckpointBuilder {
     pub fn new(
         store: Store,
         sync: BlobSynchronizer,
-        parent_tool_call_id: Option<String>,
         base: Option<pb::ConversationStateStructure>,
     ) -> Self {
         Self {
             store,
             sync,
-            parent_tool_call_id,
+            parent_tool_call_id: None,
             base: base.unwrap_or_default(),
             model: String::new(),
             max_context_tokens: None,
@@ -62,21 +64,23 @@ impl CheckpointBuilder {
 
     pub fn configure(
         &mut self,
-        model: String,
-        max_context_tokens: Option<u64>,
-        instructions: String,
-        tool_definitions: Vec<ToolDefinition>,
+        run: &PreparedRun,
+        prompt: &PromptSpec,
         dynamic_tools: HashSet<String>,
         turn_user: Option<pb::UserMessage>,
     ) {
-        self.model = model;
-        self.max_context_tokens = max_context_tokens;
-        self.instructions = instructions;
-        self.allowed_tools = tool_definitions
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect();
-        self.tool_definitions = tool_definitions;
+        self.parent_tool_call_id = match &run.kind {
+            RunKind::Root => None,
+            RunKind::Subagent {
+                parent_tool_call_id,
+                ..
+            } => parent_tool_call_id.clone(),
+        };
+        self.model = run.model.model_id.clone();
+        self.max_context_tokens = run.model.context_window_tokens;
+        self.instructions = prompt.instructions.clone();
+        self.allowed_tools = prompt.tools.iter().map(|tool| tool.name.clone()).collect();
+        self.tool_definitions = prompt.tools.clone();
         self.dynamic_tools = dynamic_tools;
         self.turn_user = turn_user;
     }

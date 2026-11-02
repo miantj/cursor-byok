@@ -81,8 +81,21 @@ pub(crate) async fn prepare(
             .unwrap_or_else(|| request_id.into()),
     );
     let run_id = execution_run_id(request_id);
-    let is_subagent = request.subagent_type_name.is_some() || parent.is_some();
-    let kind = if is_subagent {
+    let previous_kind = if parent.is_none()
+        && matches!(
+            request
+                .action
+                .as_ref()
+                .and_then(|action| action.action.as_ref()),
+            Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(_))
+        ) {
+        store.latest_run_kind(&conversation_id).await?
+    } else {
+        None
+    };
+    let kind = if let Some(kind) = previous_kind {
+        kind
+    } else if request.subagent_type_name.is_some() || parent.is_some() {
         let parent_run_id = match parent {
             Some(parent) => {
                 store
@@ -104,6 +117,7 @@ pub(crate) async fn prepare(
     } else {
         RunKind::Root
     };
+    let is_subagent = matches!(&kind, RunKind::Subagent { .. });
     let mut base_messages = if request.conversation_state.is_some() {
         Some(
             checkpoint

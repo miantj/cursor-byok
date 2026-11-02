@@ -1,15 +1,19 @@
 //! Implements Cursor account information services.
 use axum::{
     body::{to_bytes, Body},
-    extract::Extension,
+    extract::{Extension, State},
     http::{header, HeaderValue, Request, Response},
 };
 use prost::Message;
 use serde_json::Value;
 
-use crate::{api::cursor::proxy, local_app, Result};
+use crate::{
+    api::cursor::proxy,
+    cursor::{protocol::connect, transport::TransportRegistry},
+    local_app, Result,
+};
 
-use super::entitlement::FreeEntitlementCache;
+use super::{entitlement::FreeEntitlementCache, model_catalog};
 
 const LOCAL_AUTH_ID: &str = "cursor-local-user";
 const LOCAL_EMAIL: &str = "cursor@ai.com";
@@ -255,23 +259,61 @@ pub async fn current_period_usage(
 }
 
 pub async fn usage_limit_status(
+    State(registry): State<TransportRegistry>,
     Extension(upstream): Extension<proxy::CursorProxy>,
     Extension(free_entitlements): Extension<FreeEntitlementCache>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    local_or_confirmed_free_or_forward(upstream, &free_entitlements, request, || {
-        proto(GetUsageLimitStatusAndActiveGrantsResponse {
+    if local_app::request_uses_local_cursor_token(request.headers())
+        || free_entitlements.is_confirmed_free(request.headers())
+    {
+        consume_body(request).await?;
+        return proto(GetUsageLimitStatusAndActiveGrantsResponse {
             usage_limit_policy_status: Some(UsageLimitPolicyStatus {
-                is_in_slow_pool: false,
-                features: Default::default(),
                 can_configure_spend_limit: true,
-                has_pending_request: false,
-                allowed_model_ids: Vec::new(),
-                allowed_model_tags: Vec::new(),
+                ..Default::default()
             }),
-        })
-    })
-    .await
+        });
+    }
+    let upstream = proxy::forward_buffered(&upstream, request).await?;
+    if !upstream.status.is_success() {
+        return Ok(upstream.into_response());
+    }
+    let response: GetUsageLimitStatusAndActiveGrantsResponse =
+        connect::decode_unary(&upstream.body)?;
+    let Some(status) = response.usage_limit_policy_status else {
+        return Ok(upstream.into_response());
+    };
+    if status.allowed_model_ids.is_empty() && status.allowed_model_tags.is_empty() {
+        return Ok(upstream.into_response());
+    }
+    let mut model_ids = registry
+        .store()
+        .models()
+        .await?
+        .into_iter()
+        .map(|model| model.model_hash)
+        .collect::<Vec<_>>();
+    model_ids.extend(
+        model_catalog::configured_plugin_models(&registry)
+            .await
+            .into_iter()
+            .map(|model| model.id),
+    );
+    model_ids.retain(|id| !status.allowed_model_ids.contains(id));
+    if model_ids.is_empty() {
+        return Ok(upstream.into_response());
+    }
+    // Official quota limits do not apply to BYOK; retain all upstream fields by merging on the wire.
+    let extra = GetUsageLimitStatusAndActiveGrantsResponse {
+        usage_limit_policy_status: Some(UsageLimitPolicyStatus {
+            allowed_model_ids: model_ids,
+            ..Default::default()
+        }),
+    }
+    .encode_to_vec();
+    let body = connect::append_unary(&upstream.body, &extra)?;
+    Ok(upstream.with_body(body))
 }
 
 pub async fn stripe_profile(

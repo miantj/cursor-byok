@@ -32,6 +32,10 @@ use crate::{
 #[path = "bugbot_tests.rs"]
 mod bugbot_tests;
 
+#[cfg(test)]
+#[path = "model_selection_tests.rs"]
+mod model_selection_tests;
+
 pub fn router(
     registry: TransportRegistry,
     clients: crate::network::NetworkClients,
@@ -111,6 +115,10 @@ fn router_with_proxy(
         .route(
             "/aiserver.v1.AiService/GetDefaultModelNudgeData",
             post(model_catalog::default_model_nudge),
+        )
+        .route(
+            "/agent.v1.AgentService/GetNewChatNudgeParameterizedModelPicker",
+            post(model_catalog::new_chat_model_nudge),
         )
         .route(
             "/aiserver.v1.AuthService/GetEmail",
@@ -405,7 +413,8 @@ fn parent_headers(headers: &HeaderMap) -> Result<Option<TransportParent>> {
     let request_id = header_text(headers, "x-parent-request-id")?;
     let tool_call_id = header_text(headers, "x-parent-agent-tool-call-id")?;
     match (request_id, tool_call_id) {
-        (None, None) => Ok(None),
+        // A tracing parent alone does not establish a new subagent ownership link.
+        (_, None) => Ok(None),
         (Some(request_id), Some(tool_call_id)) => Ok(Some(TransportParent {
             request_id: request_id.into(),
             tool_call_id: tool_call_id.into(),
@@ -422,4 +431,34 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>
         .map(|value| value.to_str())
         .transpose()
         .map_err(|error| crate::Error::Protocol(format!("invalid {name} header: {error}")))
+}
+
+#[cfg(test)]
+mod parent_header_tests {
+    use super::*;
+
+    #[test]
+    fn tracing_parent_does_not_require_a_subagent_tool_call() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-parent-request-id",
+            HeaderValue::from_static("previous-turn"),
+        );
+        assert_eq!(parent_headers(&headers).unwrap(), None);
+
+        headers.insert(
+            "x-parent-agent-tool-call-id",
+            HeaderValue::from_static("task-call"),
+        );
+        assert_eq!(
+            parent_headers(&headers).unwrap(),
+            Some(TransportParent {
+                request_id: "previous-turn".into(),
+                tool_call_id: "task-call".into(),
+            })
+        );
+
+        headers.remove("x-parent-request-id");
+        assert!(parent_headers(&headers).is_err());
+    }
 }

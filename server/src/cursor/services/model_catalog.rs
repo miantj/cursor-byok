@@ -1,16 +1,18 @@
 //! Publishes the configured model catalog to Cursor.
 use axum::{
-    body::{Body, Bytes},
+    body::{to_bytes, Body},
     extract::{Extension, State},
     http::{header, HeaderValue, Request, Response, StatusCode},
 };
-use bytes::{BufMut, BytesMut};
 use prost::Message;
 
 use crate::{
     api::cursor::proxy::{self, CursorProxy},
-    cursor::{protocol::proto::agent::v1 as agent, transport::TransportRegistry},
-    model::{format_token_count, parse_token_count, ModelConfig},
+    cursor::{
+        protocol::{connect, proto::agent::v1 as agent},
+        transport::TransportRegistry,
+    },
+    model::{format_token_count, parse_token_count, ModelConfig, ModelType},
     plugin::PluginModelDescriptor,
     Error, Result,
 };
@@ -344,7 +346,17 @@ pub async fn default_model_nudge(
     ))
 }
 
-async fn configured_plugin_models(registry: &TransportRegistry) -> Vec<PluginModelDescriptor> {
+pub async fn new_chat_model_nudge(request: Request<Body>) -> Result<Response<Body>> {
+    to_bytes(request.into_body(), usize::MAX)
+        .await
+        .map_err(|error| Error::Protocol(format!("cannot read request body: {error}")))?;
+    // A delayed new-chat recommendation can overwrite a model selected after the request began.
+    Ok(local_response(Vec::new()))
+}
+
+pub(super) async fn configured_plugin_models(
+    registry: &TransportRegistry,
+) -> Vec<PluginModelDescriptor> {
     match registry.plugins() {
         Some(plugins) => plugins.configured_models().await,
         None => Vec::new(),
@@ -406,20 +418,7 @@ fn merge_response(upstream: proxy::BufferedResponse, extra: Vec<u8>) -> Result<R
         tracing::warn!(status = %upstream.status, "Cursor model catalog upstream rejected request; using local catalog");
         return Ok(local_response(extra));
     }
-    let (framed, payload) = unary_payload(&upstream.body)?;
-    let body = if framed {
-        let mut merged = BytesMut::with_capacity(5 + payload.len() + extra.len());
-        merged.put_u8(0);
-        merged.put_u32((payload.len() + extra.len()) as u32);
-        merged.extend_from_slice(payload);
-        merged.extend_from_slice(&extra);
-        merged.freeze()
-    } else {
-        let mut merged = BytesMut::with_capacity(payload.len() + extra.len());
-        merged.extend_from_slice(payload);
-        merged.extend_from_slice(&extra);
-        merged.freeze()
-    };
+    let body = connect::append_unary(&upstream.body, &extra)?;
     Ok(upstream.with_body(body))
 }
 
@@ -433,32 +432,21 @@ fn local_response(body: Vec<u8>) -> Response<Body> {
     response
 }
 
-fn unary_payload(body: &Bytes) -> Result<(bool, &[u8])> {
-    if body.len() < 5 {
-        return Ok((false, body));
-    }
-    let flags = body[0];
-    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-    if length != body.len() - 5 {
-        return Ok((false, body));
-    }
-    if flags != 0 {
-        return Err(Error::Protocol(format!(
-            "cannot merge compressed or terminal model catalog frame: flags={flags}"
-        )));
-    }
-    Ok((true, &body[5..]))
-}
-
 fn available_model(model: &ModelConfig) -> AvailableModel {
     let contexts = context_options(model.context_window_tokens);
     let tooltip = model_tooltip(model);
+    let default_effort = match model.model_type {
+        ModelType::OpenAi => model.reasoning_effort.as_deref(),
+        ModelType::Anthropic => model.anthropic_thinking_effort.as_deref(),
+    }
+    .unwrap_or("high");
     let variants = model_variants(
         &model.model_hash,
         &model.display_name,
         &tooltip,
         &contexts,
         true,
+        default_effort,
     );
     let legacy_slugs = variants
         .iter()
@@ -585,6 +573,7 @@ fn model_variants(
     tooltip: &TooltipData,
     contexts: &[(String, String)],
     thinking: bool,
+    default_effort: &str,
 ) -> Vec<ModelVariant> {
     // 非思考模型没有 Effort 轴,变体网格只剩 Context × Fast。
     let efforts: &[Option<(&str, &str)>] = if thinking {
@@ -602,7 +591,7 @@ fn model_variants(
     for (context, context_name) in contexts {
         for effort in efforts {
             for fast in [false, true] {
-                variants.push(model_variant(
+                let mut variant = model_variant(
                     name,
                     display_name,
                     tooltip,
@@ -610,7 +599,13 @@ fn model_variants(
                     context_name,
                     *effort,
                     fast,
-                ));
+                );
+                let is_default = context == DEFAULT_CONTEXT
+                    && !fast
+                    && effort.is_none_or(|(effort, _)| effort == default_effort);
+                variant.is_default_max_config = is_default.then_some(true);
+                variant.is_default_non_max_config = is_default.then_some(true);
+                variants.push(variant);
             }
         }
     }
@@ -644,8 +639,6 @@ fn model_variant(
             "{display_name} <span style=\"color: var(--cursor-text-tertiary);\">{suffix}</span>"
         )
     };
-    let is_default =
-        context == DEFAULT_CONTEXT && !fast && effort.is_none_or(|(effort, _)| effort == "high");
     let mut parameter_values = vec![ModelParameterValue {
         id: "context".into(),
         value: context.into(),
@@ -664,8 +657,8 @@ fn model_variant(
         parameter_values,
         display_name: display_name.clone(),
         is_max_mode: false,
-        is_default_max_config: is_default.then_some(true),
-        is_default_non_max_config: is_default.then_some(true),
+        is_default_max_config: None,
+        is_default_non_max_config: None,
         tooltip_data: Some(tooltip.clone()),
         display_name_outside_picker: Some(display_name),
         variant_string_representation: Some(match effort {
@@ -696,7 +689,14 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
     };
     // Effort 与上下文档位由宿主统一提供,与内置模型一致;插件不再声明这两项。
     let contexts = context_options(None);
-    let variants = model_variants(&model.id, &model.display_name, &tooltip, &contexts, true);
+    let variants = model_variants(
+        &model.id,
+        &model.display_name,
+        &tooltip,
+        &contexts,
+        true,
+        "high",
+    );
     let legacy_slugs = variants
         .iter()
         .filter_map(|variant| variant.legacy_slug.clone())
@@ -800,6 +800,60 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn catalog_defaults_use_each_models_configured_effort() {
+        for model_type in [ModelType::OpenAi, ModelType::Anthropic] {
+            for (effort, _) in EFFORTS {
+                let mut model = model();
+                model.model_type = model_type;
+                model.reasoning_effort = Some(if model_type == ModelType::OpenAi {
+                    effort.into()
+                } else {
+                    "low".into()
+                });
+                model.anthropic_thinking_effort = Some(if model_type == ModelType::Anthropic {
+                    effort.into()
+                } else {
+                    "low".into()
+                });
+                let catalog = available_model(&model);
+                let defaults = catalog
+                    .variants
+                    .iter()
+                    .filter(|variant| variant.is_default_non_max_config == Some(true))
+                    .collect::<Vec<_>>();
+                assert_eq!(defaults.len(), 1);
+                assert_eq!(defaults[0].is_default_max_config, Some(true));
+                assert_eq!(
+                    defaults[0]
+                        .parameter_values
+                        .iter()
+                        .find(|parameter| parameter.id == "reasoning")
+                        .unwrap()
+                        .value,
+                    effort,
+                    "wrong default for {model_type:?}"
+                );
+                assert_eq!(catalog.name, model.model_hash);
+                assert_eq!(catalog.variants.len(), CONTEXTS.len() * EFFORTS.len() * 2);
+            }
+        }
+    }
+
+    #[test]
+    fn unconfigured_effort_keeps_high_as_the_catalog_default() {
+        let catalog = available_model(&model());
+        let default = catalog
+            .variants
+            .iter()
+            .find(|variant| variant.is_default_non_max_config == Some(true))
+            .unwrap();
+        assert!(default
+            .parameter_values
+            .iter()
+            .any(|parameter| parameter.id == "reasoning" && parameter.value == "high"));
     }
 
     #[test]

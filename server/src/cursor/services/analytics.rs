@@ -1,16 +1,15 @@
 //! Implements Cursor analytics endpoints and event handling.
 use axum::{
-    body::{Body, Bytes},
+    body::Body,
     extract::Extension,
     http::{header, HeaderValue, Request, Response, StatusCode},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use bytes::{BufMut, BytesMut};
 use prost::Message;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::{api::cursor::proxy, Error, Result};
+use crate::{api::cursor::proxy, cursor::protocol::connect, Error, Result};
 
 pub const BOOTSTRAP_STATSIG_PATH: &str = "/aiserver.v1.AnalyticsService/BootstrapStatsig";
 const AGENT_RETRIES_GATE: &str = "nal_agent_retries";
@@ -49,12 +48,17 @@ pub async fn bootstrap_statsig(
 }
 
 fn patch_upstream(response: proxy::BufferedResponse) -> Result<Response<Body>> {
-    let (framed, payload) = unary_payload(&response.body)?;
+    let (framed, payload) = connect::unary_payload(&response.body)?;
     let mut message = BootstrapStatsigResponse::decode(payload)?;
     let mut config = serde_json::from_str::<Value>(&message.config)?;
     apply_agent_gates(&mut config)?;
     message.config = serde_json::to_string(&config)?;
-    Ok(response.with_body(encode_unary(&message, framed)))
+    let body = if framed {
+        connect::encode_message(&message)?
+    } else {
+        message.encode_to_vec().into()
+    };
+    Ok(response.with_body(body))
 }
 
 fn local_response() -> Result<Response<Body>> {
@@ -151,35 +155,6 @@ fn local_gate(name: &str, value: bool) -> Value {
     })
 }
 
-fn unary_payload(body: &Bytes) -> Result<(bool, &[u8])> {
-    if body.len() < 5 {
-        return Ok((false, body));
-    }
-    let flags = body[0];
-    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-    if length != body.len() - 5 {
-        return Ok((false, body));
-    }
-    if flags != 0 {
-        return Err(Error::Protocol(format!(
-            "cannot patch compressed or terminal Statsig frame: flags={flags}"
-        )));
-    }
-    Ok((true, &body[5..]))
-}
-
-fn encode_unary(message: &impl Message, framed: bool) -> Bytes {
-    let payload = message.encode_to_vec();
-    if !framed {
-        return Bytes::from(payload);
-    }
-    let mut output = BytesMut::with_capacity(5 + payload.len());
-    output.put_u8(0);
-    output.put_u32(payload.len() as u32);
-    output.extend_from_slice(&payload);
-    output.freeze()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +171,10 @@ mod tests {
                 let loop_key = statsig_key(&config, LOCAL_LOOP_GATE);
                 let retries_key = statsig_key(&config, AGENT_RETRIES_GATE);
                 config["feature_gates"][&loop_key] = json!({ "value": true });
+                let message = BootstrapStatsigResponse {
+                    config: config.to_string(),
+                    generated_at_ms: 123,
+                };
                 let upstream = proxy::BufferedResponse {
                     status: StatusCode::OK,
                     headers: [(
@@ -204,19 +183,17 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
-                    body: encode_unary(
-                        &BootstrapStatsigResponse {
-                            config: config.to_string(),
-                            generated_at_ms: 123,
-                        },
-                        framed,
-                    ),
+                    body: if framed {
+                        connect::encode_message(&message).unwrap()
+                    } else {
+                        message.encode_to_vec().into()
+                    },
                 };
                 let response = patch_upstream(upstream).unwrap();
                 let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
                     .unwrap();
-                let (actual_framed, payload) = unary_payload(&body).unwrap();
+                let (actual_framed, payload) = connect::unary_payload(&body).unwrap();
                 assert_eq!(actual_framed, framed);
                 let message = BootstrapStatsigResponse::decode(payload).unwrap();
                 assert_eq!(message.generated_at_ms, 123);

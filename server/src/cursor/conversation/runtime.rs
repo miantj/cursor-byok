@@ -659,7 +659,6 @@ fn spawn_run_request(
         let mut checkpoint = CheckpointBuilder::new(
             dependencies.store.clone(),
             blob_sync.clone(),
-            handle.parent().map(|parent| parent.tool_call_id.clone()),
             request.conversation_state.clone(),
         );
         let prepared = tokio::select! {
@@ -700,10 +699,8 @@ fn spawn_run_request(
             }
         };
         checkpoint.configure(
-            prepared.model.model_id.clone(),
-            prepared.model.context_window_tokens,
-            context.checkpoint_prompt.instructions.clone(),
-            context.checkpoint_prompt.tools.clone(),
+            &prepared,
+            &context.checkpoint_prompt,
             context.dynamic_tools.keys().cloned().collect(),
             context.turn_user.clone(),
         );
@@ -725,8 +722,9 @@ fn spawn_run_request(
                 )
                 .await
             {
-                CommandResult::Applied | CommandResult::Duplicate => {
+                CommandResult::Applied | CommandResult::Duplicate | CommandResult::StaleTarget => {
                     if !generation.superseded.is_cancelled() {
+                        let _ = handle.emit(&crate::cursor::protocol::events::turn_ended(None));
                         let _ = handle
                             .command(TransportCommand::RunFinished {
                                 generation: generation.id,
@@ -753,17 +751,6 @@ fn spawn_run_request(
                 }
                 CommandResult::RunEnded => {
                     prepared.initial_messages.clear();
-                }
-                CommandResult::StaleTarget => {
-                    if !generation.superseded.is_cancelled() {
-                        let _ = handle
-                            .command(TransportCommand::RunFinished {
-                                generation: generation.id,
-                                finish: RunFinish::Transport(TransportFinish::Success),
-                            })
-                            .await;
-                    }
-                    return;
                 }
             }
         }
