@@ -81,15 +81,44 @@ pub(crate) async fn prepare(
             .unwrap_or_else(|| request_id.into()),
     );
     let run_id = execution_run_id(request_id);
-    let previous_kind = if parent.is_none()
-        && matches!(
-            request
-                .action
-                .as_ref()
-                .and_then(|action| action.action.as_ref()),
-            Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(_))
-        ) {
-        store.latest_run_kind(&conversation_id).await?
+    let previous_kind = if parent.is_none() {
+        match request
+            .action
+            .as_ref()
+            .and_then(|action| action.action.as_ref())
+        {
+            Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) => {
+                let mut tool_call_ids = Vec::new();
+                let mut agent_or_task_ids = Vec::new();
+                for completion in &action.completions {
+                    if let Some(tool_call_id) = completion
+                        .tool_call_id
+                        .as_ref()
+                        .filter(|id| !id.is_empty())
+                    {
+                        tool_call_ids.push(tool_call_id.clone());
+                    }
+                    if let Some(subagent_id) = completion
+                        .subagent_id
+                        .as_ref()
+                        .filter(|id| !id.is_empty())
+                    {
+                        agent_or_task_ids.push(subagent_id.clone());
+                    }
+                    if !completion.task_id.is_empty() {
+                        agent_or_task_ids.push(completion.task_id.clone());
+                    }
+                }
+                store
+                    .run_kind_for_background_completion(
+                        &conversation_id,
+                        &tool_call_ids,
+                        &agent_or_task_ids,
+                    )
+                    .await?
+            }
+            _ => None,
+        }
     } else {
         None
     };

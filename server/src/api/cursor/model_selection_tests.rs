@@ -133,8 +133,8 @@ struct UsageResponse {
 #[tokio::test]
 async fn new_chat_nudges_cannot_silently_replace_the_selected_model() {
     let fixture = Fixture::new(Bytes::from_static(&[0x0a, 0x00]), true).await;
-    // A request started before selection may still carry Auto when its response arrives.
-    for model_id in [fixture.model_id.as_str(), "default"] {
+    // Route always returns an empty nudge so a delayed response cannot replace the selection.
+    for model_id in [fixture.model_id.as_str(), "default", "auto", ""] {
         let request = agent::GetNewChatNudgeParameterizedModelPickerRequest {
             current_model: Some(agent::RequestedModel {
                 model_id: model_id.into(),
@@ -185,8 +185,8 @@ async fn official_auto_only_usage_limits_keep_byok_models_selectable() {
         assert_eq!(status.stage, 2);
         assert_eq!(status.allowed_model_tags, vec!["auto"]);
         assert_eq!(response.active_grants, original.active_grants);
-        let offset = if framed { 5 } else { 0 };
-        assert!(body[offset..].starts_with(&upstream[offset..]));
+        let (actual_framed, _) = connect::unary_payload(&body).unwrap();
+        assert_eq!(actual_framed, framed);
     }
 }
 

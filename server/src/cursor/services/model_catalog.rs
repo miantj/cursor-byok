@@ -350,8 +350,11 @@ pub async fn new_chat_model_nudge(request: Request<Body>) -> Result<Response<Bod
     to_bytes(request.into_body(), usize::MAX)
         .await
         .map_err(|error| Error::Protocol(format!("cannot read request body: {error}")))?;
-    // A delayed new-chat recommendation can overwrite a model selected after the request began.
-    Ok(local_response(Vec::new()))
+    // Always empty: this route is local-only, and a delayed upstream nudge can overwrite a
+    // model selected after the RPC started (including Auto → BYOK races).
+    Ok(local_response(
+        agent::GetNewChatNudgeParameterizedModelPickerResponse::default().encode_to_vec(),
+    ))
 }
 
 pub(super) async fn configured_plugin_models(
@@ -435,11 +438,22 @@ fn local_response(body: Vec<u8>) -> Response<Body> {
 fn available_model(model: &ModelConfig) -> AvailableModel {
     let contexts = context_options(model.context_window_tokens);
     let tooltip = model_tooltip(model);
-    let default_effort = match model.model_type {
+    let configured_effort = match model.model_type {
         ModelType::OpenAi => model.reasoning_effort.as_deref(),
         ModelType::Anthropic => model.anthropic_thinking_effort.as_deref(),
-    }
-    .unwrap_or("high");
+    };
+    let default_effort = match configured_effort {
+        Some(effort) if EFFORTS.iter().any(|(value, _)| *value == effort) => effort,
+        Some(effort) => {
+            tracing::warn!(
+                effort,
+                model = %model.model_hash,
+                "configured reasoning effort is not in the catalog; falling back to high"
+            );
+            "high"
+        }
+        None => "high",
+    };
     let variants = model_variants(
         &model.model_hash,
         &model.display_name,
@@ -845,6 +859,22 @@ mod tests {
     #[test]
     fn unconfigured_effort_keeps_high_as_the_catalog_default() {
         let catalog = available_model(&model());
+        let default = catalog
+            .variants
+            .iter()
+            .find(|variant| variant.is_default_non_max_config == Some(true))
+            .unwrap();
+        assert!(default
+            .parameter_values
+            .iter()
+            .any(|parameter| parameter.id == "reasoning" && parameter.value == "high"));
+    }
+
+    #[test]
+    fn invalid_configured_effort_falls_back_to_high() {
+        let mut model = model();
+        model.reasoning_effort = Some("not-a-real-effort".into());
+        let catalog = available_model(&model);
         let default = catalog
             .variants
             .iter()

@@ -131,22 +131,65 @@ struct SpendLimitUsage {
 struct GetUsageLimitStatusAndActiveGrantsResponse {
     #[prost(message, optional, tag = "1")]
     usage_limit_policy_status: Option<UsageLimitPolicyStatus>,
+    // Opaque nested messages so re-encoding keeps upstream grant/nudge bytes.
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    active_grants: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    third_party_usage_nudge: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    model_recommendation_nudge: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct UsageLimitPolicyStatus {
     #[prost(bool, tag = "1")]
     is_in_slow_pool: bool,
+    #[prost(string, optional, tag = "2")]
+    error_title: Option<String>,
+    #[prost(string, optional, tag = "3")]
+    error_detail: Option<String>,
+    #[prost(int32, optional, tag = "4")]
+    slowness_ms: Option<i32>,
     #[prost(map = "string, string", tag = "5")]
     features: std::collections::HashMap<String, String>,
     #[prost(bool, tag = "6")]
     can_configure_spend_limit: bool,
+    #[prost(string, optional, tag = "7")]
+    limit_type: Option<String>,
     #[prost(bool, tag = "8")]
     has_pending_request: bool,
     #[prost(string, repeated, tag = "9")]
     allowed_model_ids: Vec<String>,
     #[prost(string, repeated, tag = "10")]
     allowed_model_tags: Vec<String>,
+    #[prost(bytes = "vec", optional, tag = "11")]
+    primary_button: Option<Vec<u8>>,
+    #[prost(int32, tag = "12")]
+    stage: i32,
+    #[prost(string, optional, tag = "13")]
+    tray_label: Option<String>,
+    #[prost(string, optional, tag = "14")]
+    tray_description: Option<String>,
+    #[prost(string, optional, tag = "15")]
+    cta_label: Option<String>,
+    #[prost(bool, optional, tag = "16")]
+    dismissible: Option<bool>,
+    #[prost(int64, optional, tag = "17")]
+    reset_at_ms: Option<i64>,
+    #[prost(int32, optional, tag = "18")]
+    reset_days_remaining: Option<i32>,
+    #[prost(bool, optional, tag = "19")]
+    can_adjust_on_demand: Option<bool>,
+    #[prost(int64, optional, tag = "20")]
+    recommended_on_demand_limit_cents: Option<i64>,
+    #[prost(int64, optional, tag = "21")]
+    on_demand_min_cents: Option<i64>,
+    #[prost(int64, optional, tag = "22")]
+    on_demand_max_cents: Option<i64>,
+    #[prost(int64, optional, tag = "23")]
+    current_on_demand_limit_cents: Option<i64>,
+    #[prost(bytes = "vec", repeated, tag = "24")]
+    allowed_model_selections: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -273,15 +316,16 @@ pub async fn usage_limit_status(
                 can_configure_spend_limit: true,
                 ..Default::default()
             }),
+            ..Default::default()
         });
     }
     let upstream = proxy::forward_buffered(&upstream, request).await?;
     if !upstream.status.is_success() {
         return Ok(upstream.into_response());
     }
-    let response: GetUsageLimitStatusAndActiveGrantsResponse =
-        connect::decode_unary(&upstream.body)?;
-    let Some(status) = response.usage_limit_policy_status else {
+    let (framed, payload) = connect::unary_payload(&upstream.body)?;
+    let mut response = GetUsageLimitStatusAndActiveGrantsResponse::decode(payload)?;
+    let Some(status) = response.usage_limit_policy_status.as_mut() else {
         return Ok(upstream.into_response());
     };
     if status.allowed_model_ids.is_empty() && status.allowed_model_tags.is_empty() {
@@ -300,19 +344,23 @@ pub async fn usage_limit_status(
             .into_iter()
             .map(|model| model.id),
     );
-    model_ids.retain(|id| !status.allowed_model_ids.contains(id));
-    if model_ids.is_empty() {
+    let mut changed = false;
+    for id in model_ids {
+        if !status.allowed_model_ids.contains(&id) {
+            status.allowed_model_ids.push(id);
+            changed = true;
+        }
+    }
+    if !changed {
         return Ok(upstream.into_response());
     }
-    // Official quota limits do not apply to BYOK; retain all upstream fields by merging on the wire.
-    let extra = GetUsageLimitStatusAndActiveGrantsResponse {
-        usage_limit_policy_status: Some(UsageLimitPolicyStatus {
-            allowed_model_ids: model_ids,
-            ..Default::default()
-        }),
-    }
-    .encode_to_vec();
-    let body = connect::append_unary(&upstream.body, &extra)?;
+    // Official quota limits do not apply to BYOK. Decode → extend allowed_model_ids →
+    // re-encode so known upstream fields stay intact without fragile wire concatenation.
+    let body = if framed {
+        connect::encode_message(&response)?
+    } else {
+        response.encode_to_vec().into()
+    };
     Ok(upstream.with_body(body))
 }
 

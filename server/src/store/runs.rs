@@ -48,25 +48,75 @@ impl Store {
         .bind(conversation_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| match row.try_get::<&str, _>("run_kind")? {
-            "root" => Ok(RunKind::Root),
-            "subagent" => {
-                let kind: String = row.try_get("subagent_kind")?;
-                Ok(RunKind::Subagent {
-                    parent_run_id: row
-                        .try_get::<Option<String>, _>("parent_run_id")?
-                        .map(RunId::new),
-                    parent_tool_call_id: row.try_get("parent_tool_call_id")?,
-                    kind: if kind == "generalPurpose" {
-                        SubagentKind::GeneralPurpose
-                    } else {
-                        SubagentKind::Named(kind)
-                    },
-                })
+        row.map(run_kind_from_row).transpose()
+    }
+
+    /// Resolve ownership for a background completion without a transport parent.
+    /// Prefer an existing run id (`subagent_id` / `task_id`), then a subagent whose
+    /// `parent_tool_call_id` matches the completion, then the run that owns a Shell/Await
+    /// call (not Task — Task owners are parents and would drop subagent ownership).
+    /// Falls back to [`Self::latest_run_kind`].
+    pub(crate) async fn run_kind_for_background_completion(
+        &self,
+        conversation_id: &ConversationId,
+        tool_call_ids: &[String],
+        agent_or_task_ids: &[String],
+    ) -> Result<Option<RunKind>> {
+        for agent_id in agent_or_task_ids.iter().filter(|id| !id.is_empty()) {
+            let row = sqlx::query(
+                "SELECT run_kind, parent_run_id, parent_tool_call_id, subagent_kind
+                 FROM runs
+                 WHERE conversation_id = ? AND run_id = ?
+                 ORDER BY created_at_ms DESC, rowid DESC
+                 LIMIT 1",
+            )
+            .bind(conversation_id.as_str())
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(kind) = row.map(run_kind_from_row).transpose()? {
+                return Ok(Some(kind));
             }
-            kind => Err(Error::Store(format!("unknown run kind: {kind}"))),
-        })
-        .transpose()
+        }
+        for tool_call_id in tool_call_ids.iter().filter(|id| !id.is_empty()) {
+            let row = sqlx::query(
+                "SELECT run_kind, parent_run_id, parent_tool_call_id, subagent_kind
+                 FROM runs
+                 WHERE conversation_id = ?
+                   AND run_kind = 'subagent'
+                   AND parent_tool_call_id = ?
+                 ORDER BY created_at_ms DESC, rowid DESC
+                 LIMIT 1",
+            )
+            .bind(conversation_id.as_str())
+            .bind(tool_call_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(kind) = row.map(run_kind_from_row).transpose()? {
+                return Ok(Some(kind));
+            }
+        }
+        for tool_call_id in tool_call_ids.iter().filter(|id| !id.is_empty()) {
+            let row = sqlx::query(
+                "SELECT r.run_kind, r.parent_run_id, r.parent_tool_call_id, r.subagent_kind
+                 FROM runs r
+                 JOIN tool_rounds tr ON tr.run_id = r.run_id
+                 JOIN tool_round_calls t ON t.round_id = tr.round_id
+                 WHERE r.conversation_id = ?
+                   AND t.call_id = ?
+                   AND lower(t.name) IN ('shell', 'await')
+                 ORDER BY tr.created_at_ms DESC, tr.round_id DESC
+                 LIMIT 1",
+            )
+            .bind(conversation_id.as_str())
+            .bind(tool_call_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(kind) = row.map(run_kind_from_row).transpose()? {
+                return Ok(Some(kind));
+            }
+        }
+        self.latest_run_kind(conversation_id).await
     }
 
     pub(crate) async fn subagent_parent_run(
@@ -308,6 +358,27 @@ impl Store {
     }
 }
 
+fn run_kind_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RunKind> {
+    match row.try_get::<&str, _>("run_kind")? {
+        "root" => Ok(RunKind::Root),
+        "subagent" => {
+            let kind: String = row.try_get("subagent_kind")?;
+            Ok(RunKind::Subagent {
+                parent_run_id: row
+                    .try_get::<Option<String>, _>("parent_run_id")?
+                    .map(RunId::new),
+                parent_tool_call_id: row.try_get("parent_tool_call_id")?,
+                kind: if kind == "generalPurpose" {
+                    SubagentKind::GeneralPurpose
+                } else {
+                    SubagentKind::Named(kind)
+                },
+            })
+        }
+        kind => Err(Error::Store(format!("unknown run kind: {kind}"))),
+    }
+}
+
 fn run_kind_columns(kind: &RunKind) -> (Option<&str>, Option<&str>, &'static str, Option<String>) {
     match kind {
         RunKind::Root => (None, None, "root", None),
@@ -324,5 +395,126 @@ fn run_kind_columns(kind: &RunKind) -> (Option<&str>, Option<&str>, &'static str
                 crate::model::SubagentKind::Named(name) => name.clone(),
             }),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ConversationId;
+
+    #[tokio::test]
+    async fn background_completion_prefers_finished_subagent_over_task_launcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        let conversation = ConversationId::new("conversation");
+        let checkpoint = store.ensure_conversation(&conversation).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (run_id, conversation_id, base_checkpoint_id, head_checkpoint_id,
+             run_kind, status, created_at_ms, updated_at_ms)
+             VALUES ('root-run', 'conversation', ?, ?, 'root', 'completed', 1, 1)",
+        )
+        .bind(checkpoint.0)
+        .bind(checkpoint.0)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_rounds (round_id, run_id, base_checkpoint_id, assistant_json, status,
+             created_at_ms, updated_at_ms)
+             VALUES ('round-1', 'root-run', ?, '{}', 'settled', 1, 1),
+                    ('round-2', 'root-run', ?, '{}', 'settled', 2, 2)",
+        )
+        .bind(checkpoint.0)
+        .bind(checkpoint.0)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_round_calls
+             (round_id, call_index, call_id, model_call_id, name, arguments_json, status)
+             VALUES ('round-1', 0, 'task-call', 'model-call', 'Task', '{}', 'completed'),
+                    ('round-2', 0, 'shell-call', 'shell-model', 'Shell', '{}', 'completed')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (run_id, conversation_id, base_checkpoint_id, head_checkpoint_id,
+             run_kind, parent_run_id, parent_tool_call_id, subagent_kind, status,
+             created_at_ms, updated_at_ms)
+             VALUES ('finished-child', 'conversation', ?, ?, 'subagent', 'root-run', 'task-call',
+             'explore', 'completed', 2, 2),
+                    ('other-child', 'conversation', ?, ?, 'subagent', 'root-run', 'other-task',
+             'explore', 'completed', 3, 3)",
+        )
+        .bind(checkpoint.0)
+        .bind(checkpoint.0)
+        .bind(checkpoint.0)
+        .bind(checkpoint.0)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        // Task launcher is Root; completion must keep the finished child's Subagent ownership.
+        let by_parent_tool = store
+            .run_kind_for_background_completion(
+                &conversation,
+                &["task-call".into()],
+                &["missing-agent".into()],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            by_parent_tool,
+            Some(RunKind::Subagent {
+                parent_tool_call_id: Some(ref id),
+                ..
+            }) if id == "task-call"
+        ));
+
+        let by_agent = store
+            .run_kind_for_background_completion(
+                &conversation,
+                &["task-call".into()],
+                &["finished-child".into()],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            by_agent,
+            Some(RunKind::Subagent {
+                parent_tool_call_id: Some(ref id),
+                ..
+            }) if id == "task-call"
+        ));
+
+        // Shell/Await may continue as the owning run when no subagent matches.
+        let by_shell = store
+            .run_kind_for_background_completion(
+                &conversation,
+                &["shell-call".into()],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_shell, Some(RunKind::Root));
+
+        let fallback = store
+            .run_kind_for_background_completion(&conversation, &[], &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            fallback,
+            Some(RunKind::Subagent {
+                parent_tool_call_id: Some(ref id),
+                ..
+            }) if id == "other-task"
+        ));
     }
 }

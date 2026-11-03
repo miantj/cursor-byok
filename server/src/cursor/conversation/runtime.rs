@@ -710,7 +710,7 @@ fn spawn_run_request(
                 .first()
                 .and_then(|message| message.runtime_event_id.clone())
                 .unwrap_or_else(|| format!("background:{}", prepared.run_id));
-            match registry
+            let delivery = registry
                 .deliver(
                     &prepared.conversation_id,
                     CompiledMessages {
@@ -720,9 +720,16 @@ fn spawn_run_request(
                         delivery: MessageDelivery::InsertMessages,
                     },
                 )
-                .await
-            {
+                .await;
+            match delivery {
                 CommandResult::Applied | CommandResult::Duplicate | CommandResult::StaleTarget => {
+                    if matches!(delivery, CommandResult::StaleTarget) {
+                        tracing::warn!(
+                            conversation_id = %prepared.conversation_id,
+                            run_id = %prepared.run_id,
+                            "background completion hit a stale delivery target; ending turn to unblock the IDE"
+                        );
+                    }
                     if !generation.superseded.is_cancelled() {
                         let _ = handle.emit(&crate::cursor::protocol::events::turn_ended(None));
                         let _ = handle
