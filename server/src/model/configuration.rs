@@ -196,6 +196,9 @@ impl ModelConfig {
         if model.context_window_tokens.is_none() {
             model.context_window_tokens = self.context_window_tokens;
         }
+        // Request-selected effort wins. Saved model effort is only a fallback when
+        // the IDE omitted reasoning — catalog defaults stay on `high` so refresh
+        // cannot overwrite a hand selection with configured xhigh.
         if model.reasoning.effort.is_none() {
             model.reasoning.effort = match self.model_type {
                 ModelType::OpenAi => self.reasoning_effort.clone(),

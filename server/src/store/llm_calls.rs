@@ -316,6 +316,21 @@ impl Store {
         }))
     }
 
+    pub async fn latest_model_hash(&self) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT model_hash FROM llm_calls
+             WHERE model_hash IS NOT NULL AND trim(model_hash) != ''
+             ORDER BY created_at_ms DESC, rowid DESC
+             LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(row) => Some(row.try_get("model_hash")?),
+            None => None,
+        })
+    }
+
     pub async fn llm_calls(&self, limit: i64) -> Result<Vec<LlmCallSummary>> {
         let rows = sqlx::query(&format!("SELECT {SUMMARY_COLUMNS} FROM llm_calls c LEFT JOIN runs r ON r.run_id = c.run_id ORDER BY c.created_at_ms DESC LIMIT ?"))
             .bind(limit.clamp(1, 500))

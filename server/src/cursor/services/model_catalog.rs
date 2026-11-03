@@ -320,9 +320,10 @@ pub async fn default_model_for_cli(
 ) -> Result<Response<Body>> {
     let models = registry.store().models().await?;
     let plugin_models = configured_plugin_models(&registry).await;
+    let preferred = latest_preferred_model_hash(&registry).await;
     Ok(local_response(
         agent::GetDefaultModelForCliResponse {
-            model: default_model_details(&models, &plugin_models),
+            model: default_model_details(&models, &plugin_models, preferred.as_deref()),
         }
         .encode_to_vec(),
     ))
@@ -331,8 +332,9 @@ pub async fn default_model_for_cli(
 pub async fn default_model(State(registry): State<TransportRegistry>) -> Result<Response<Body>> {
     let models = registry.store().models().await?;
     let plugin_models = configured_plugin_models(&registry).await;
+    let preferred = latest_preferred_model_hash(&registry).await;
     Ok(local_response(
-        default_model_response(&models, &plugin_models).encode_to_vec(),
+        default_model_response(&models, &plugin_models, preferred.as_deref()).encode_to_vec(),
     ))
 }
 
@@ -366,22 +368,64 @@ pub(super) async fn configured_plugin_models(
     }
 }
 
+async fn latest_preferred_model_hash(registry: &TransportRegistry) -> Option<String> {
+    match registry.store().latest_model_hash().await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "cannot read latest model hash for GetDefaultModel");
+            None
+        }
+    }
+}
+
+fn configured_effort(model: &ModelConfig) -> Option<&str> {
+    match model.model_type {
+        ModelType::OpenAi => model.reasoning_effort.as_deref(),
+        ModelType::Anthropic => model.anthropic_thinking_effort.as_deref(),
+    }
+}
+
+fn effort_prefers_aggressive_default(model: &ModelConfig) -> bool {
+    matches!(configured_effort(model), Some("xhigh" | "max"))
+}
+
 fn default_model_details(
     models: &[ModelConfig],
     plugin_models: &[PluginModelDescriptor],
+    preferred: Option<&str>,
 ) -> Option<agent::ModelDetails> {
+    let model_id = default_model_id(models, plugin_models, preferred);
     models
-        .first()
+        .iter()
+        .find(|model| model.model_hash == model_id)
         .map(usable_model)
-        .or_else(|| plugin_models.first().map(usable_plugin_model))
+        .or_else(|| {
+            plugin_models
+                .iter()
+                .find(|model| model.id == model_id)
+                .map(usable_plugin_model)
+        })
 }
 
 fn default_model_id<'a>(
     models: &'a [ModelConfig],
     plugin_models: &'a [PluginModelDescriptor],
+    preferred: Option<&str>,
 ) -> &'a str {
+    if let Some(preferred) = preferred.filter(|id| !id.is_empty()) {
+        if let Some(model) = models.iter().find(|model| model.model_hash == preferred) {
+            return model.model_hash.as_str();
+        }
+        if let Some(model) = plugin_models.iter().find(|model| model.id == preferred) {
+            return model.id.as_str();
+        }
+    }
+    // Prefer a stable high/unset config over xhigh/max so GetDefaultModel does not yank
+    // the picker to Extra High when several local entries share a provider model.
     models
-        .first()
+        .iter()
+        .find(|model| !effort_prefers_aggressive_default(model))
+        .or_else(|| models.first())
         .map(|model| model.model_hash.as_str())
         .or_else(|| plugin_models.first().map(|model| model.id.as_str()))
         .unwrap_or_default()
@@ -390,8 +434,9 @@ fn default_model_id<'a>(
 fn default_model_response(
     models: &[ModelConfig],
     plugin_models: &[PluginModelDescriptor],
+    preferred: Option<&str>,
 ) -> DefaultModelResponse {
-    let model = default_model_id(models, plugin_models).to_owned();
+    let model = default_model_id(models, plugin_models, preferred).to_owned();
     DefaultModelResponse {
         thinking_model: model.clone(),
         model,
@@ -438,29 +483,15 @@ fn local_response(body: Vec<u8>) -> Response<Body> {
 fn available_model(model: &ModelConfig) -> AvailableModel {
     let contexts = context_options(model.context_window_tokens);
     let tooltip = model_tooltip(model);
-    let configured_effort = match model.model_type {
-        ModelType::OpenAi => model.reasoning_effort.as_deref(),
-        ModelType::Anthropic => model.anthropic_thinking_effort.as_deref(),
-    };
-    let default_effort = match configured_effort {
-        Some(effort) if EFFORTS.iter().any(|(value, _)| *value == effort) => effort,
-        Some(effort) => {
-            tracing::warn!(
-                effort,
-                model = %model.model_hash,
-                "configured reasoning effort is not in the catalog; falling back to high"
-            );
-            "high"
-        }
-        None => "high",
-    };
+    // Catalog `is_default_*` always points at `high`. Using the saved model effort (often
+    // xhigh) here made AvailableModels refresh overwrite a hand-selected High with Extra High.
+    // Request-time configure() still applies the saved effort when the IDE omits one.
     let variants = model_variants(
         &model.model_hash,
         &model.display_name,
         &tooltip,
         &contexts,
         true,
-        default_effort,
     );
     let legacy_slugs = variants
         .iter()
@@ -587,7 +618,6 @@ fn model_variants(
     tooltip: &TooltipData,
     contexts: &[(String, String)],
     thinking: bool,
-    default_effort: &str,
 ) -> Vec<ModelVariant> {
     // 非思考模型没有 Effort 轴,变体网格只剩 Context × Fast。
     let efforts: &[Option<(&str, &str)>] = if thinking {
@@ -616,7 +646,7 @@ fn model_variants(
                 );
                 let is_default = context == DEFAULT_CONTEXT
                     && !fast
-                    && effort.is_none_or(|(effort, _)| effort == default_effort);
+                    && effort.is_none_or(|(effort, _)| effort == "high");
                 variant.is_default_max_config = is_default.then_some(true);
                 variant.is_default_non_max_config = is_default.then_some(true);
                 variants.push(variant);
@@ -709,7 +739,6 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
         &tooltip,
         &contexts,
         true,
-        "high",
     );
     let legacy_slugs = variants
         .iter()
@@ -816,8 +845,23 @@ mod tests {
         }
     }
 
+    fn default_reasoning(catalog: &AvailableModel) -> &str {
+        catalog
+            .variants
+            .iter()
+            .find(|variant| variant.is_default_non_max_config == Some(true))
+            .and_then(|variant| {
+                variant
+                    .parameter_values
+                    .iter()
+                    .find(|parameter| parameter.id == "reasoning")
+            })
+            .map(|parameter| parameter.value.as_str())
+            .expect("catalog default reasoning")
+    }
+
     #[test]
-    fn catalog_defaults_use_each_models_configured_effort() {
+    fn catalog_default_stays_high_even_when_model_configures_xhigh() {
         for model_type in [ModelType::OpenAi, ModelType::Anthropic] {
             for (effort, _) in EFFORTS {
                 let mut model = model();
@@ -841,14 +885,9 @@ mod tests {
                 assert_eq!(defaults.len(), 1);
                 assert_eq!(defaults[0].is_default_max_config, Some(true));
                 assert_eq!(
-                    defaults[0]
-                        .parameter_values
-                        .iter()
-                        .find(|parameter| parameter.id == "reasoning")
-                        .unwrap()
-                        .value,
-                    effort,
-                    "wrong default for {model_type:?}"
+                    default_reasoning(&catalog),
+                    "high",
+                    "catalog default must stay high for configured {effort} ({model_type:?})"
                 );
                 assert_eq!(catalog.name, model.model_hash);
                 assert_eq!(catalog.variants.len(), CONTEXTS.len() * EFFORTS.len() * 2);
@@ -858,32 +897,49 @@ mod tests {
 
     #[test]
     fn unconfigured_effort_keeps_high_as_the_catalog_default() {
-        let catalog = available_model(&model());
-        let default = catalog
-            .variants
-            .iter()
-            .find(|variant| variant.is_default_non_max_config == Some(true))
-            .unwrap();
-        assert!(default
-            .parameter_values
-            .iter()
-            .any(|parameter| parameter.id == "reasoning" && parameter.value == "high"));
+        assert_eq!(default_reasoning(&available_model(&model())), "high");
     }
 
     #[test]
-    fn invalid_configured_effort_falls_back_to_high() {
-        let mut model = model();
-        model.reasoning_effort = Some("not-a-real-effort".into());
-        let catalog = available_model(&model);
-        let default = catalog
-            .variants
-            .iter()
-            .find(|variant| variant.is_default_non_max_config == Some(true))
-            .unwrap();
-        assert!(default
-            .parameter_values
-            .iter()
-            .any(|parameter| parameter.id == "reasoning" && parameter.value == "high"));
+    fn get_default_model_prefers_last_used_over_sort_order() {
+        let mut xhigh = model();
+        xhigh.model_hash = "xhigh-model".into();
+        xhigh.sort_order = 1;
+        xhigh.reasoning_effort = Some("xhigh".into());
+        let mut high = model();
+        high.model_hash = "high-model".into();
+        high.sort_order = 2;
+        high.reasoning_effort = Some("high".into());
+        let models = vec![xhigh, high];
+        assert_eq!(
+            default_model_id(&models, &[], Some("high-model")),
+            "high-model"
+        );
+        assert_eq!(
+            default_model_response(&models, &[], Some("high-model")).model,
+            "high-model"
+        );
+    }
+
+    #[test]
+    fn get_default_model_skips_aggressive_sort_first_without_preference() {
+        let mut xhigh = model();
+        xhigh.model_hash = "xhigh-model".into();
+        xhigh.sort_order = 1;
+        xhigh.reasoning_effort = Some("xhigh".into());
+        let mut high = model();
+        high.model_hash = "high-model".into();
+        high.sort_order = 2;
+        high.reasoning_effort = Some("high".into());
+        let models = vec![xhigh.clone(), high];
+        assert_eq!(default_model_id(&models, &[], None), "high-model");
+        assert_eq!(
+            default_model_details(&models, &[], None)
+                .unwrap()
+                .model_id,
+            "high-model"
+        );
+        assert_eq!(default_model_id(&[xhigh], &[], None), "xhigh-model");
     }
 
     #[test]
@@ -930,10 +986,10 @@ mod tests {
     #[test]
     fn cli_default_responses_use_the_local_model_hash() {
         let models = vec![model()];
-        let details = default_model_details(&models, &[]).expect("default model");
+        let details = default_model_details(&models, &[], None).expect("default model");
         assert_eq!(details.model_id, "local-model-hash");
 
-        let response = default_model_response(&models, &[]);
+        let response = default_model_response(&models, &[], None);
         assert_eq!(response.model, "local-model-hash");
         assert_eq!(response.thinking_model, "local-model-hash");
 
