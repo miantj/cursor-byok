@@ -94,6 +94,12 @@ async fn rpc(router: &Router, path: &str, message: &impl Message) -> Response<Bo
 }
 
 async fn append(router: &Router, seqno: i64, message: &pb::AgentClientMessage) -> Response<Body> {
+    let payload = message.encode_to_vec();
+    let (data, data_binary) = if seqno == 0 {
+        (String::new(), payload)
+    } else {
+        (hex::encode(payload), Vec::new())
+    };
     rpc(
         router,
         "/aiserver.v1.BidiService/BidiAppend",
@@ -102,8 +108,8 @@ async fn append(router: &Router, seqno: i64, message: &pb::AgentClientMessage) -
                 request_id: "review-request".into(),
             }),
             append_seqno: seqno,
-            data: hex::encode(message.encode_to_vec()),
-            data_binary: Vec::new(),
+            data,
+            data_binary,
         },
     )
     .await
