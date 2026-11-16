@@ -1,16 +1,14 @@
-//! Decides when to compact provider-visible context and builds a stable fallback summary.
+//! Decides when to compact provider-visible context without discarding unsummarized history.
 
 use std::collections::HashSet;
 
 use crate::{
     model::{
         estimate_context_tokens, estimate_projected_messages_tokens, CanonicalMessage, PreparedRun,
-        ProjectedContent, ProjectedMessage, Role,
+        ProjectedMessage,
     },
     store::ContextUsageAnchor,
 };
-
-const FALLBACK_CHARS: usize = 12_000;
 
 /// Fraction of the context window kept free, as a divisor: 10 = 10%.
 ///
@@ -48,75 +46,12 @@ pub(super) fn is_context_overflow(message: &str) -> bool {
         || (lowered.contains("maximum context length") && lowered.contains("token"))
 }
 
-/// Builds the history for a compaction call.
+/// Builds an isolated summary request while preserving every conversation turn.
 ///
-/// Two properties matter, and replaying the raw history guarantees neither:
-///
-/// 1. The history must end with a user message. Otherwise providers read the
-///    request as an assistant prefill and refuse it outright: Anthropic answers
-///    "This model does not support assistant message prefill. The conversation
-///    must end with a user message."
-/// 2. The history must fit the context window. Compaction runs precisely
-///    because the conversation is too large, so replaying all of it asks the
-///    summarizer to accept a prompt that is already over the limit and the
-///    call fails with "prompt is too long".
-///
-/// Either failure falls back to the truncated summary, which is usually still
-/// too large, so the conversation stays over its window and cannot recover.
-///
-/// Trimming keeps the most recent turns and only ever cuts at a user-message
-/// boundary, so an assistant tool call is never separated from its results.
-pub(super) fn compaction_history(
-    history: Vec<ProjectedMessage>,
-    context_window: Option<u64>,
-) -> Vec<ProjectedMessage> {
-    super::history::user_terminated(
-        trim_to_context(history, context_window),
-        "compaction:instruction",
-        INSTRUCTIONS,
-    )
-}
-
-fn trim_to_context(
-    mut history: Vec<ProjectedMessage>,
-    context_window: Option<u64>,
-) -> Vec<ProjectedMessage> {
-    let Some(budget) = context_window
-        .filter(|window| *window > 0)
-        .map(context_budget)
-        .map(|budget| budget.saturating_sub(OUTPUT_TOKENS))
-        .filter(|budget| *budget > 0)
-    else {
-        return history;
-    };
-    if estimate_projected_messages_tokens(&history) <= budget {
-        return history;
-    }
-    // Walk back from the newest turn, keeping whole user-delimited turns.
-    let mut kept = 0;
-    let mut newest_turn = None;
-    for (index, message) in history.iter().enumerate().rev() {
-        if !is_turn_boundary(message) {
-            continue;
-        }
-        newest_turn.get_or_insert(index);
-        if estimate_projected_messages_tokens(&history[index..]) > budget {
-            break;
-        }
-        kept = history.len() - index;
-    }
-    if kept == 0 {
-        // Not even the newest turn fits. Keep it anyway rather than sending an
-        // empty history: an empty summarize call returns a summary of nothing
-        // that would then replace the whole conversation.
-        let start = newest_turn.unwrap_or(0);
-        return history.split_off(start);
-    }
-    history.split_off(history.len() - kept)
-}
-
-fn is_turn_boundary(message: &ProjectedMessage) -> bool {
-    message.role == Role::User && matches!(message.content, ProjectedContent::Parts(_))
+/// Dropping early turns can erase the user's goal or earlier constraints. If
+/// the full input exceeds the provider's window, fail without replacing history.
+pub(super) fn compaction_history(history: Vec<ProjectedMessage>) -> Vec<ProjectedMessage> {
+    super::history::user_terminated(history, "compaction:instruction", INSTRUCTIONS)
 }
 
 pub(super) fn estimated_tokens(
@@ -194,25 +129,12 @@ pub(super) fn partition(
     (compactable, retained)
 }
 
-pub(super) fn fallback_summary(messages: &[CanonicalMessage]) -> String {
-    let serialized = serde_json::to_string(messages).unwrap_or_default();
-    let start = serialized
-        .char_indices()
-        .rev()
-        .nth(FALLBACK_CHARS.saturating_sub(1))
-        .map_or(0, |(index, _)| index);
-    format!(
-        "Durable recent conversation state:\n{}",
-        &serialized[start..]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{
-        project_messages, CheckpointId, ContentPart, ConversationId, ModelSpec, Origin, PromptSpec,
-        Role, RunAction, RunId, RunKind,
+        project_messages, CheckpointId, ContentPart, ConversationId, ModelSpec, Origin,
+        ProjectedContent, PromptSpec, Role, RunAction, RunId, RunKind,
     };
 
     fn prepared(context_window_tokens: u64) -> PreparedRun {
@@ -340,7 +262,7 @@ mod tests {
         // Providers reject an assistant-terminated history as a prefill, which
         // made every automatic compaction fall back to the truncated summary.
         let history = vec![user("u1", "question"), assistant("a1", "answer")];
-        let prepared = compaction_history(history, Some(200_000));
+        let prepared = compaction_history(history);
         assert_eq!(prepared.last().unwrap().role, Role::User);
         assert_eq!(
             prepared.last().unwrap().message_id,
@@ -349,53 +271,33 @@ mod tests {
 
         // An already user-terminated history is left alone.
         let history = vec![assistant("a1", "answer"), user("u2", "next")];
-        let prepared = compaction_history(history.clone(), Some(200_000));
+        let prepared = compaction_history(history.clone());
         assert_eq!(prepared, history);
     }
 
     #[test]
-    fn compaction_history_is_trimmed_to_fit_the_context_window() {
-        // Compaction runs because the conversation is too large, so the
-        // summarize call must not replay a prompt that is over the window.
-        let big = "x".repeat(400_000);
+    fn compaction_input_never_discards_the_original_goal_to_fit_the_window() {
         let history = vec![
-            user("u1", &big),
-            assistant("a1", &big),
-            user("u2", &big),
-            assistant("a2", "recent answer"),
+            user(
+                "original-goal",
+                "Keep the original objective and constraints.",
+            ),
+            assistant("old-work", &"x".repeat(400_000)),
+            user("follow-up", "Continue the original task."),
+            assistant("recent-work", "Still working."),
         ];
-        let window = 200_000;
-        let prepared = compaction_history(history, Some(window));
-
-        let budget = context_budget(window) - OUTPUT_TOKENS;
-        assert!(estimate_projected_messages_tokens(&prepared) <= budget);
-        assert_eq!(prepared.last().unwrap().role, Role::User);
-        // The newest turn survives the trim and is never split.
-        assert!(prepared.iter().any(|message| message.message_id == "u2"));
-        assert!(prepared.iter().any(|message| message.message_id == "a2"));
-        assert!(!prepared.iter().any(|message| message.message_id == "u1"));
-    }
-
-    #[test]
-    fn compaction_history_keeps_the_newest_turn_even_when_it_is_over_budget() {
-        // A history whose newest turn alone exceeds the budget is still sent
-        // rather than trimmed to nothing: a summary of nothing would replace
-        // the whole conversation.
-        let history = vec![
-            user("u1", "old"),
-            assistant("a1", "old answer"),
-            user("u2", &"x".repeat(400_000)),
-            assistant("a2", "answer"),
-        ];
-        let prepared = compaction_history(history, Some(50_000));
-        assert_eq!(prepared[0].message_id, "u2");
+        let prepared = compaction_history(history.clone());
+        assert!(
+            prepared.starts_with(&history),
+            "summarizing only recent turns would silently discard the original goal"
+        );
         assert_eq!(prepared.last().unwrap().role, Role::User);
     }
 
     #[test]
-    fn compaction_history_without_a_context_window_is_untouched_apart_from_termination() {
+    fn compaction_history_is_untouched_apart_from_termination() {
         let history = vec![user("u1", "question"), assistant("a1", "answer")];
-        let prepared = compaction_history(history.clone(), None);
+        let prepared = compaction_history(history.clone());
         assert_eq!(prepared[..2], history[..]);
         assert_eq!(prepared.last().unwrap().role, Role::User);
     }
@@ -443,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_anchor_uses_full_fallback() {
+    fn missing_anchor_uses_the_full_estimate() {
         let messages = vec![CanonicalMessage::text(
             "user",
             Role::User,
@@ -460,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_anchor_message_count_uses_full_fallback() {
+    fn invalid_anchor_message_count_uses_the_full_estimate() {
         let messages = vec![CanonicalMessage::text(
             "user",
             Role::User,

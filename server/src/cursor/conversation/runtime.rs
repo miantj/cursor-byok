@@ -28,6 +28,10 @@ use super::{
 
 pub struct ConversationRuntime;
 
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;
+
 const CONTINUATION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone)]
@@ -38,7 +42,7 @@ struct RunGeneration {
     finished: CancellationToken,
     run: Arc<parking_lot::Mutex<Option<RunHandle>>>,
     results: ToolResultSender,
-    runtime_actions: mpsc::UnboundedSender<compile::RuntimeAction>,
+    runtime_actions: mpsc::UnboundedSender<pb::ConversationAction>,
     tool_runtime: CursorToolRuntime,
     tools: ToolDispatcher,
 }
@@ -49,6 +53,7 @@ struct TransportActorGuard(TransportHandle);
 
 impl Drop for TransportActorGuard {
     fn drop(&mut self) {
+        self.0.mark_disconnected();
         self.0.close_transport();
     }
 }
@@ -75,8 +80,11 @@ impl ConversationRuntime {
             );
             let mut inbox = OrderedInbox::starting_at(0);
             let tool_runtime_factory = CursorToolRuntime::default();
-            let context_sync =
-                RequestContextSynchronizer::new(handle.clone(), dependencies.store.clone());
+            let context_sync = RequestContextSynchronizer::new(
+                handle.clone(),
+                dependencies.store.clone(),
+                tool_runtime_factory.clone(),
+            );
             let mut current = None::<RunGeneration>;
             let mut next_generation = 1_u64;
             let mut pending_finish = None::<(u64, TransportFinish)>;
@@ -251,7 +259,7 @@ impl ConversationRuntime {
                                     Some(pb::agent_client_message::Message::ExecClientMessage(
                                         message,
                                     )) => {
-                                        if context_sync.handle_client(&message).await {
+                                        if context_sync.handle_client(&message) {
                                             continue;
                                         }
                                         let Some(generation) = current.as_ref() else {
@@ -284,8 +292,7 @@ impl ConversationRuntime {
                                         use pb::exec_client_control_message::Message;
                                         match message.message {
                                             Some(Message::StreamClose(close)) => {
-                                                if context_sync.handle_stream_close(close.id).await
-                                                {
+                                                if context_sync.handle_stream_close(close.id) {
                                                     continue;
                                                 }
                                                 let Some(generation) = current.as_ref() else {
@@ -307,16 +314,13 @@ impl ConversationRuntime {
                                                 }
                                             }
                                             Some(Message::Throw(throw)) => {
-                                                if context_sync
-                                                    .handle_throw(
-                                                        throw.id,
-                                                        format!(
-                                                            "Cursor request context failed: {}",
-                                                            throw.error
-                                                        ),
-                                                    )
-                                                    .await
-                                                {
+                                                if context_sync.handle_throw(
+                                                    throw.id,
+                                                    format!(
+                                                        "Cursor request context failed: {}",
+                                                        throw.error
+                                                    ),
+                                                ) {
                                                     continue;
                                                 }
                                                 let Some(generation) = current.as_ref() else {
@@ -411,20 +415,23 @@ impl ConversationRuntime {
                                         ),
                                     ) => match conversation_action.action.clone() {
                                         Some(
-                                            pb::conversation_action::Action::UserMessageAction(
-                                                action,
-                                            ),
+                                            pb::conversation_action::Action::UserMessageAction(_),
                                         ) => {
                                             let delivered_to_active_run =
                                                 current.as_ref().is_some_and(|generation| {
-                                                    generation.run.lock().as_ref().is_some_and(
-                                                        |run| run.phase() == RunPhase::Running,
-                                                    ) && generation
-                                                        .runtime_actions
-                                                        .send(compile::RuntimeAction::UserMessage(
-                                                            action.clone(),
-                                                        ))
-                                                        .is_ok()
+                                                    let run = generation.run.lock();
+                                                    let preparing = run.is_none()
+                                                        && !waiting_for_action
+                                                        && !generation.finished.is_cancelled();
+                                                    let running = run.as_ref().is_some_and(|run| {
+                                                        run.phase() == RunPhase::Running
+                                                    });
+                                                    drop(run);
+                                                    (preparing || running)
+                                                        && generation
+                                                            .runtime_actions
+                                                            .send(conversation_action.clone())
+                                                            .is_ok()
                                                 });
                                             if delivered_to_active_run {
                                                 continue;
@@ -437,6 +444,11 @@ impl ConversationRuntime {
                                             request.conversation_state = None;
                                             request.pre_fetched_blobs.clear();
                                             waiting_for_action = false;
+                                            if draining {
+                                                handle.reopen();
+                                                draining = false;
+                                                pending_finish = None;
+                                            }
                                             start_generation(
                                                 &registry,
                                                 &handle,
@@ -479,16 +491,14 @@ impl ConversationRuntime {
                                             }
                                         }
                                         Some(
-                                            pb::conversation_action::Action::InjectContextAction(
-                                                action,
-                                            ),
+                                            pb::conversation_action::Action::InjectContextAction(_),
                                         ) => {
                                             let Some(generation) = current.as_ref() else {
                                                 continue;
                                             };
                                             if generation
                                                 .runtime_actions
-                                                .send(compile::RuntimeAction::Inject(action))
+                                                .send(conversation_action)
                                                 .is_err()
                                             {
                                                 generation.results.send_error(crate::Error::Protocol(
@@ -567,7 +577,7 @@ async fn start_generation(
     };
     let (results, result_receiver) = tool_result_channel();
     let (runtime_actions, runtime_action_receiver) =
-        mpsc::unbounded_channel::<compile::RuntimeAction>();
+        mpsc::unbounded_channel::<pb::ConversationAction>();
     let tool_runtime = tool_runtime_factory.next_run();
     let tools = ToolDispatcher::with_results(
         tool_runtime.clone(),
@@ -578,7 +588,7 @@ async fn start_generation(
     let generation = RunGeneration {
         id: *next_generation,
         request: request.clone(),
-        superseded: CancellationToken::new(),
+        superseded: handle.disconnect_token().child_token(),
         finished: CancellationToken::new(),
         run: Arc::new(parking_lot::Mutex::new(None)),
         results,
@@ -641,7 +651,7 @@ fn spawn_run_request(
     generation: RunGeneration,
     previous_finished: Option<CancellationToken>,
     results: ToolResultReceiver,
-    runtime_actions: mpsc::UnboundedReceiver<compile::RuntimeAction>,
+    runtime_actions: mpsc::UnboundedReceiver<pb::ConversationAction>,
 ) {
     tokio::spawn(async move {
         let _finished = FinishGeneration(generation.finished.clone());
@@ -812,6 +822,7 @@ fn spawn_run_request(
                 blob_sync,
                 checkpoint,
                 tool_runtime: generation.tool_runtime.clone(),
+                context_sync,
             },
         );
         let finish = match output.run().await {

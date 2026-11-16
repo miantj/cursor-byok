@@ -12,6 +12,8 @@ pub struct OutputHub {
 struct OutputState {
     history: Vec<Bytes>,
     subscribers: Vec<mpsc::UnboundedSender<Bytes>>,
+    run_sse_subscribers: usize,
+    disconnecting: bool,
     closed: bool,
 }
 
@@ -29,15 +31,27 @@ impl OutputHub {
     }
 
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Bytes> {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        self.state.lock().subscribe()
+    }
+
+    pub(crate) fn subscribe_run_sse(&self) -> Option<mpsc::UnboundedReceiver<Bytes>> {
         let mut state = self.state.lock();
-        for frame in &state.history {
-            let _ = sender.send(frame.clone());
+        if state.disconnecting {
+            return None;
         }
-        if !state.closed {
-            state.subscribers.push(sender);
+        state.run_sse_subscribers += 1;
+        Some(state.subscribe())
+    }
+
+    pub(crate) fn unsubscribe_run_sse(&self, completed: bool) -> bool {
+        let mut state = self.state.lock();
+        state.run_sse_subscribers -= 1;
+        if completed || state.closed || state.run_sse_subscribers != 0 {
+            return false;
         }
-        receiver
+        // Commit disconnect before queuing it so a later subscriber cannot join a cancelled channel.
+        state.disconnecting = true;
+        true
     }
 
     pub fn close(&self) -> bool {
@@ -47,7 +61,19 @@ impl OutputHub {
         }
         state.closed = true;
         state.subscribers.clear();
-        drop(state);
         true
+    }
+}
+
+impl OutputState {
+    fn subscribe(&mut self) -> mpsc::UnboundedReceiver<Bytes> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for frame in &self.history {
+            let _ = sender.send(frame.clone());
+        }
+        if !self.closed {
+            self.subscribers.push(sender);
+        }
+        receiver
     }
 }

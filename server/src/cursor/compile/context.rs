@@ -21,25 +21,35 @@ pub async fn hydrate(
     request: &pb::AgentRunRequest,
     context_sync: &RequestContextSynchronizer,
 ) -> Result<pb::RequestContext> {
-    let mut context = request_context(request).cloned().unwrap_or_default();
-    let Some(parts) = request
-        .action
-        .as_ref()
-        .and_then(|action| action.request_context_parts.as_ref())
-    else {
-        if is_background_completion(request) {
-            return context_sync
-                .load(request.conversation_id.as_deref().unwrap_or_default())
-                .await;
+    let Some(action) = request.action.as_ref() else {
+        return Ok(pb::RequestContext::default());
+    };
+    hydrate_action(
+        action,
+        request.conversation_id.as_deref().unwrap_or_default(),
+        context_sync,
+    )
+    .await
+}
+
+pub(crate) async fn hydrate_action(
+    action: &pb::ConversationAction,
+    conversation_id: &str,
+    context_sync: &RequestContextSynchronizer,
+) -> Result<pb::RequestContext> {
+    let mut context = action_request_context(action).cloned().unwrap_or_default();
+    let Some(parts) = action.request_context_parts.as_ref() else {
+        if matches!(
+            action.action,
+            Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(_))
+        ) {
+            return context_sync.load(conversation_id).await;
         }
         return Ok(context);
     };
 
     if let Some(current) = context_sync
-        .refresh_if_missing(
-            parts,
-            request.conversation_id.as_deref().unwrap_or_default(),
-        )
+        .refresh_if_missing(parts, conversation_id)
         .await?
     {
         context.rules = current.rules;
@@ -102,16 +112,6 @@ pub async fn hydrate(
         context.mcp_meta_tool_options = part.mcp_meta_tool_options;
     }
     Ok(context)
-}
-
-fn is_background_completion(request: &pb::AgentRunRequest) -> bool {
-    matches!(
-        request
-            .action
-            .as_ref()
-            .and_then(|action| action.action.as_ref()),
-        Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(_))
-    )
 }
 
 async fn decode_part<T: Message + Default>(
@@ -177,8 +177,7 @@ pub fn merge_local_rules(context: &mut pb::RequestContext, rules_dir: &Path) {
     }
 }
 
-pub fn request_context(request: &pb::AgentRunRequest) -> Option<&pb::RequestContext> {
-    let action = request.action.as_ref()?;
+fn action_request_context(action: &pb::ConversationAction) -> Option<&pb::RequestContext> {
     action
         .request_context_parts
         .as_ref()
@@ -189,6 +188,17 @@ pub fn request_context(request: &pb::AgentRunRequest) -> Option<&pb::RequestCont
             }
             pb::conversation_action::Action::ExecutePlanAction(action) => {
                 action.request_context.as_ref()
+            }
+            pb::conversation_action::Action::ResumeAction(action) => {
+                action.request_context.as_ref()
+            }
+            pb::conversation_action::Action::InjectContextAction(action) => {
+                match action.payload.as_ref()? {
+                    pb::inject_context_action::Payload::UserContext(context) => {
+                        context.request_context.as_ref()
+                    }
+                    _ => None,
+                }
             }
             _ => None,
         })

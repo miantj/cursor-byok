@@ -233,7 +233,7 @@ async fn finish_stream(recorder: &CallRecorder, cancellation: &CancellationToken
     if cancellation.is_cancelled() {
         recorder.cancelled().await
     } else {
-        let error = Error::Provider("provider stream ended without Done".into());
+        let error = Error::transient_provider("provider stream ended without Done");
         recorder.failed(&error).await?;
         Err(error)
     }
@@ -274,7 +274,7 @@ async fn next_provider_event(
 }
 
 fn stream_idle_timeout_error(idle_timeout: Duration) -> Error {
-    Error::Provider(format!(
+    Error::transient_provider(format!(
         "provider stream idle timeout: no events received for {} seconds ({} minutes)",
         idle_timeout.as_secs(),
         idle_timeout.as_secs() / 60
@@ -282,7 +282,7 @@ fn stream_idle_timeout_error(idle_timeout: Duration) -> Error {
 }
 
 fn request_timeout_error(request_timeout: Duration) -> Error {
-    Error::Provider(format!(
+    Error::transient_provider(format!(
         "provider request timed out after {} seconds ({} minutes)",
         request_timeout.as_secs(),
         request_timeout.as_secs() / 60
@@ -292,7 +292,7 @@ fn request_timeout_error(request_timeout: Duration) -> Error {
 fn normalize_provider_stream_error(error: Error, request_timeout: Duration) -> Error {
     match error {
         Error::Http(source) if source.is_timeout() => request_timeout_error(request_timeout),
-        Error::Http(source) if source.is_body() => Error::Provider(format!(
+        Error::Http(source) if source.is_body() => Error::transient_provider(format!(
             "provider stream transport failed while reading the response body: {}",
             root_error_message(&source)
         )),
@@ -402,7 +402,12 @@ mod tests {
 
     #[test]
     fn timeout_errors_state_the_boundary_and_duration() {
-        let Error::Provider(idle) = stream_idle_timeout_error(Duration::from_secs(30 * 60)) else {
+        let Error::ProviderResponse {
+            message: idle,
+            retryable: true,
+            ..
+        } = stream_idle_timeout_error(Duration::from_secs(30 * 60))
+        else {
             panic!("idle timeout must be a provider error");
         };
         assert_eq!(
@@ -410,7 +415,12 @@ mod tests {
             "provider stream idle timeout: no events received for 1800 seconds (30 minutes)"
         );
 
-        let Error::Provider(request) = request_timeout_error(Duration::from_secs(60 * 60)) else {
+        let Error::ProviderResponse {
+            message: request,
+            retryable: true,
+            ..
+        } = request_timeout_error(Duration::from_secs(60 * 60))
+        else {
             panic!("request timeout must be a provider error");
         };
         assert_eq!(

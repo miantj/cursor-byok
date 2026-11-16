@@ -17,11 +17,6 @@ use crate::{
 
 use super::{context, images};
 
-pub(crate) enum RuntimeAction {
-    Inject(pb::InjectContextAction),
-    UserMessage(pb::UserMessageAction),
-}
-
 pub(crate) async fn compile_user_message_action(
     action: &pb::UserMessageAction,
     current_mode: Mode,
@@ -225,10 +220,11 @@ async fn compile_with_timestamp(
     .await
 }
 
-pub(super) fn compile_request_context(
+pub(crate) fn compile_request_context(
     event_id: &str,
     request_context: &pb::RequestContext,
     history: &[CanonicalMessage],
+    latest: Option<&CanonicalMessage>,
 ) -> Result<Option<CanonicalMessage>> {
     let time = Time::now(
         request_context
@@ -240,23 +236,28 @@ pub(super) fn compile_request_context(
     if text.is_empty() {
         return Ok(None);
     }
-    let message = CanonicalMessage::text(
+    let mut message = CanonicalMessage::text(
         format!("request-context:{event_id}"),
         Role::User,
         Origin::Prompt,
         text,
     );
-    Ok(should_project_request_context(history, &message).then_some(message))
+    message.runtime_event_id = Some(format!("request-context:{event_id}"));
+    Ok(should_project_request_context(history, latest, &message).then_some(message))
 }
 
 fn should_project_request_context(
     history: &[CanonicalMessage],
+    latest: Option<&CanonicalMessage>,
     current: &CanonicalMessage,
 ) -> bool {
-    history
-        .iter()
-        .rev()
-        .find(|message| message.message_id.starts_with("request-context:"))
+    latest
+        .or_else(|| {
+            history
+                .iter()
+                .rev()
+                .find(|message| message.message_id.starts_with("request-context:"))
+        })
         .is_none_or(|previous| previous.content != current.content)
 }
 

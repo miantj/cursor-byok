@@ -209,7 +209,7 @@ impl Provider for OpenAiChatProvider {
                 });
             }
             let finish = finish.or_else(|| saw_done_marker.then_some(if tools.is_empty() { FinishReason::Stop } else { FinishReason::ToolUse }))
-                .ok_or_else(|| Error::Provider("OpenAI Chat stream ended without finish_reason".into()))?;
+                .ok_or_else(|| Error::transient_provider("OpenAI Chat stream ended without finish_reason"))?;
             yield ModelEvent::Done(finish);
         })
     }

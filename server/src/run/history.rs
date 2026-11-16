@@ -1,14 +1,11 @@
-//! Guarantees provider history ends with a user message before dispatch.
+//! Terminates isolated summary requests without changing committed conversation history.
 
 use crate::model::{ContentPart, ProjectedContent, ProjectedMessage, Role};
 
-/// Appends a transient user message when the history ends with the assistant.
+/// Appends the summary instruction when the history ends with the assistant.
 ///
-/// Providers read an assistant-terminated history as a prefill request, and
-/// Anthropic refuses it outright: "This model does not support assistant
-/// message prefill. The conversation must end with a user message." The
-/// appended message is provider-visible only; it is never persisted, so the
-/// committed checkpoint stays an exact prefix of the next turn.
+/// Providers can reject assistant prefill. Only summary calls may use this
+/// transient tail; ordinary continuation must be committed before dispatch.
 pub(super) fn user_terminated(
     mut history: Vec<ProjectedMessage>,
     message_id: &str,

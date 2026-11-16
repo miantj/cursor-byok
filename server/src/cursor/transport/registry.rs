@@ -32,7 +32,8 @@ pub struct TransportRegistry {
 struct RegistryInner {
     local: Mutex<HashMap<String, LocalTransport>>,
     next_local_generation: AtomicU64,
-    upstream: Mutex<HashMap<String, UpstreamTransport>>,
+    upstream: parking_lot::Mutex<HashMap<String, UpstreamTransport>>,
+    next_upstream_generation: AtomicU64,
     route_changed: Notify,
     store: Store,
     traces: CursorTraceService,
@@ -49,6 +50,7 @@ struct LocalTransport {
 
 struct UpstreamTransport {
     generation: u64,
+    subscribers: usize,
     bugbot_replay: Option<SharedBugbotReplay>,
 }
 
@@ -119,7 +121,8 @@ impl TransportRegistry {
             inner: Arc::new(RegistryInner {
                 local: Mutex::new(HashMap::new()),
                 next_local_generation: AtomicU64::new(1),
-                upstream: Mutex::new(HashMap::new()),
+                upstream: parking_lot::Mutex::new(HashMap::new()),
+                next_upstream_generation: AtomicU64::new(1),
                 route_changed: Notify::new(),
                 traces: CursorTraceService::new(store.clone()),
                 conversations: ConversationRegistry::new(
@@ -225,15 +228,16 @@ impl TransportRegistry {
     }
 
     pub(crate) async fn mark_upstream(&self, request_id: &str, replay: Option<BugbotReplay>) {
-        let mut upstream = self.inner.upstream.lock().await;
-        let generation = upstream
-            .get(request_id)
-            .map_or(0, |transport| transport.generation)
-            + 1;
+        let mut upstream = self.inner.upstream.lock();
+        let generation = self
+            .inner
+            .next_upstream_generation
+            .fetch_add(1, Ordering::Relaxed);
         upstream.insert(
             request_id.into(),
             UpstreamTransport {
                 generation,
+                subscribers: 0,
                 bugbot_replay: replay.map(|replay| Arc::new(Mutex::new(replay))),
             },
         );
@@ -242,7 +246,7 @@ impl TransportRegistry {
     }
 
     pub async fn upstream(&self, request_id: &str) -> bool {
-        self.inner.upstream.lock().await.contains_key(request_id)
+        self.inner.upstream.lock().contains_key(request_id)
     }
 
     pub(crate) async fn bugbot_replay(
@@ -252,7 +256,6 @@ impl TransportRegistry {
         self.inner
             .upstream
             .lock()
-            .await
             .get(request_id)
             .and_then(|transport| {
                 transport
@@ -270,30 +273,51 @@ impl TransportRegistry {
             if self.inner.local.lock().await.contains_key(request_id) {
                 return TransportRoute::Local;
             }
-            if let Some(transport) = self.inner.upstream.lock().await.get(request_id) {
+            if let Some(transport) = self.inner.upstream.lock().get(request_id) {
                 return TransportRoute::Upstream(transport.generation);
             }
             changed.await;
         }
     }
 
+    pub(crate) fn subscribe_upstream(&self, request_id: &str, generation: u64) -> Result<()> {
+        let mut upstream = self.inner.upstream.lock();
+        let transport = upstream
+            .get_mut(request_id)
+            .filter(|transport| transport.generation == generation)
+            .ok_or_else(|| crate::Error::RunNotFound(request_id.into()))?;
+        transport.subscribers += 1;
+        Ok(())
+    }
+
+    pub(crate) fn unsubscribe_upstream(&self, request_id: &str, generation: u64) {
+        let mut upstream = self.inner.upstream.lock();
+        let Some(transport) = upstream
+            .get_mut(request_id)
+            .filter(|transport| transport.generation == generation)
+        else {
+            return;
+        };
+        transport.subscribers -= 1;
+        if transport.subscribers == 0 {
+            upstream.remove(request_id);
+        }
+    }
+
     pub fn finish_upstream(&self, request_id: String, generation: u64) {
-        let registry = self.clone();
-        tokio::spawn(async move {
-            let mut upstream = registry.inner.upstream.lock().await;
-            if upstream
-                .get(&request_id)
-                .is_some_and(|transport| transport.generation == generation)
-            {
-                upstream.remove(&request_id);
-            }
-        });
+        let mut upstream = self.inner.upstream.lock();
+        if upstream
+            .get(&request_id)
+            .is_some_and(|transport| transport.generation == generation)
+        {
+            upstream.remove(&request_id);
+        }
     }
 
     pub async fn shutdown(&self) {
         self.inner.conversations.shutdown().await;
         let handles = std::mem::take(&mut *self.inner.local.lock().await);
-        self.inner.upstream.lock().await.clear();
+        self.inner.upstream.lock().clear();
         for transport in handles.into_values() {
             transport.handle.disconnect().await;
             let _ = tokio::time::timeout(

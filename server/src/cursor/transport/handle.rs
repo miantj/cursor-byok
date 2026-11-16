@@ -113,6 +113,20 @@ impl TransportHandle {
         self.output.subscribe()
     }
 
+    pub(crate) fn subscribe_run_sse(&self) -> Result<mpsc::UnboundedReceiver<Bytes>> {
+        self.output
+            .subscribe_run_sse()
+            .ok_or_else(|| Error::RunNotFound(self.request_id.clone()))
+    }
+
+    pub(crate) fn unsubscribe_run_sse(&self, completed: bool) -> bool {
+        let disconnect = self.output.unsubscribe_run_sse(completed);
+        if disconnect {
+            self.begin_close();
+        }
+        disconnect
+    }
+
     pub fn emit_frame(&self, frame: Bytes) -> bool {
         self.output.emit(frame)
     }

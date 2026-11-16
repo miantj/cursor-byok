@@ -30,6 +30,8 @@ pub struct ModelCycleFailure {
     pub partial_reasoning: String,
     pub usage: Option<Usage>,
     pub retryable: bool,
+    pub retry_after: Option<std::time::Duration>,
+    pub output_started: bool,
 }
 
 struct OpenTool {
@@ -38,9 +40,24 @@ struct OpenTool {
 }
 
 pub async fn consume_model_cycle(
+    stream: ProviderStream,
+    client: &mpsc::Sender<RunEvent>,
+    cancellation: &CancellationToken,
+) -> std::result::Result<ModelCycleResult, Box<ModelCycleFailure>> {
+    let mut visible_output = false;
+    let mut result = consume_stream(stream, client, cancellation, &mut visible_output).await;
+    if let Err(failure) = &mut result {
+        failure.output_started = visible_output;
+        failure.retryable &= !visible_output;
+    }
+    result
+}
+
+async fn consume_stream(
     mut stream: ProviderStream,
     client: &mpsc::Sender<RunEvent>,
     cancellation: &CancellationToken,
+    visible_output: &mut bool,
 ) -> std::result::Result<ModelCycleResult, Box<ModelCycleFailure>> {
     let mut model_call_id = None;
     let mut text = String::new();
@@ -85,7 +102,15 @@ pub async fn consume_model_cycle(
         let event = match next {
             Ok(event) => event,
             Err(error) => {
-                return Err(failure(error.into(), text, reasoning, usage));
+                let retryable = error.is_retryable();
+                let retry_after = match &error {
+                    crate::Error::ProviderResponse { retry_after, .. } => *retry_after,
+                    _ => None,
+                };
+                let mut failure = failure(error.into(), text, reasoning, usage);
+                failure.retryable = retryable;
+                failure.retry_after = retry_after;
+                return Err(failure);
             }
         };
         if finish.is_some() {
@@ -118,6 +143,7 @@ pub async fn consume_model_cycle(
                 if !text_open {
                     Err("provider emitted TextDelta before TextStart")
                 } else {
+                    *visible_output |= !delta.is_empty();
                     text.push_str(&delta);
                     send(client, RunEvent::TextDelta(delta)).await
                 }
@@ -143,6 +169,7 @@ pub async fn consume_model_cycle(
                 if thinking_started.is_none() {
                     Err("provider emitted ThinkingDelta before ThinkingStart")
                 } else {
+                    *visible_output |= !delta.is_empty();
                     reasoning.push_str(&delta);
                     send(client, RunEvent::ThinkingDelta(delta)).await
                 }
@@ -180,6 +207,7 @@ pub async fn consume_model_cycle(
                         Err("provider reused a tool call_id")
                     }
                     Entry::Vacant(entry) => {
+                        *visible_output = true;
                         entry.insert(OpenTool {
                             call: ToolCall {
                                 index,
@@ -291,19 +319,21 @@ pub async fn consume_model_cycle(
     }
 
     let Some(finish_reason) = finish else {
-        return Err(failure(
+        let mut failure = failure(
             RunFailure::Provider("provider stream reached EOF before Done".into()),
             text,
             reasoning,
             usage,
-        ));
+        );
+        failure.retryable = true;
+        return Err(failure);
     };
     let calls = tools
         .into_values()
         .map(|tool| tool.call)
         .collect::<Vec<_>>();
     if finish_reason == FinishReason::Length {
-        return Err(terminal_failure(
+        return Err(failure(
             RunFailure::Provider("model stopped before completing the response".into()),
             text,
             reasoning,
@@ -373,48 +403,14 @@ fn failure(
     partial_reasoning: String,
     usage: Option<Usage>,
 ) -> Box<ModelCycleFailure> {
-    let retryable = match &failure {
-        RunFailure::Protocol(_) => true,
-        RunFailure::Provider(message) if is_rejected_request(message) => false,
-        RunFailure::Provider(_) => true,
-        RunFailure::Store(_) | RunFailure::Client(_) => false,
-    };
-    Box::new(ModelCycleFailure {
-        failure,
-        partial_text,
-        partial_reasoning,
-        usage,
-        retryable,
-    })
-}
-
-/// A rejected request (wrong key, unknown model, malformed or oversized body)
-/// fails identically every time, so retrying it only delays the error the user
-/// needs to see. Provider failures are formatted as `<label> <status>: <body>`,
-/// so only the head before the body is inspected. 408 and 425 are timing
-/// failures and stay retryable.
-fn is_rejected_request(message: &str) -> bool {
-    let head = message.split_once(": ").map_or(message, |(head, _)| head);
-    head.split_whitespace().any(|token| {
-        token.len() == 3
-            && token.starts_with('4')
-            && token.bytes().all(|byte| byte.is_ascii_digit())
-            && !matches!(token, "408" | "425" | "429")
-    })
-}
-
-fn terminal_failure(
-    failure: RunFailure,
-    partial_text: String,
-    partial_reasoning: String,
-    usage: Option<Usage>,
-) -> Box<ModelCycleFailure> {
     Box::new(ModelCycleFailure {
         failure,
         partial_text,
         partial_reasoning,
         usage,
         retryable: false,
+        retry_after: None,
+        output_started: false,
     })
 }
 
@@ -501,22 +497,111 @@ mod tests {
         assert!(event_rx.try_recv().is_err(), "usage must be forwarded once");
     }
 
-    #[test]
-    fn other_provider_errors_are_retryable() {
-        let result = failure(
-            RunFailure::Provider("Anthropic 502 Bad Gateway".into()),
-            String::new(),
-            String::new(),
-            None,
-        );
-        assert!(result.retryable);
-        let timeout = failure(
-            RunFailure::Provider("Anthropic 408 Request Timeout".into()),
-            String::new(),
-            String::new(),
-            None,
-        );
-        assert!(timeout.retryable);
+    #[tokio::test]
+    async fn protocol_violations_are_terminal_before_output() {
+        let stream = Box::pin(tokio_stream::iter(vec![Ok(ModelEvent::TextDelta(
+            "invalid".into(),
+        ))]));
+        let (tx, _rx) = mpsc::channel(8);
+        let failure = consume_model_cycle(stream, &tx, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(!failure.retryable, "invalid event ordering must not retry");
+    }
+
+    #[tokio::test]
+    async fn visible_content_prevents_retry_including_tool_cards_and_thinking() {
+        for content in [
+            vec![
+                ModelEvent::TextStart,
+                ModelEvent::TextDelta("partial".into()),
+            ],
+            vec![
+                ModelEvent::ThinkingStart,
+                ModelEvent::ThinkingDelta("thinking".into()),
+            ],
+            vec![ModelEvent::ToolCallStart {
+                index: 0,
+                call_id: "tool".into(),
+                name: "Read".into(),
+            }],
+        ] {
+            let mut events = vec![Ok(ModelEvent::Start {
+                model_call_id: "call".into(),
+            })];
+            events.extend(content.into_iter().map(Ok));
+            events.push(Err(crate::Error::transient_provider("stream disconnected")));
+            let (tx, _rx) = mpsc::channel(8);
+            let failure = consume_model_cycle(
+                Box::pin(tokio_stream::iter(events)),
+                &tx,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                !failure.retryable,
+                "visible content must never be silently retried"
+            );
+            assert!(failure.output_started);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_content_blocks_do_not_count_as_visible_output() {
+        for content in [
+            vec![ModelEvent::TextStart, ModelEvent::TextDelta(String::new())],
+            vec![
+                ModelEvent::ThinkingStart,
+                ModelEvent::ThinkingDelta(String::new()),
+            ],
+        ] {
+            let mut events = vec![Ok(ModelEvent::Start {
+                model_call_id: "call".into(),
+            })];
+            events.extend(content.into_iter().map(Ok));
+            events.push(Err(crate::Error::transient_provider("stream disconnected")));
+            let (tx, _rx) = mpsc::channel(8);
+            let failure = consume_model_cycle(
+                Box::pin(tokio_stream::iter(events)),
+                &tx,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(failure.retryable);
+            assert!(!failure.output_started);
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_before_visible_content_can_retry() {
+        let (tx, _rx) = mpsc::channel(8);
+        let stream = Box::pin(tokio_stream::iter(vec![Ok(ModelEvent::Start {
+            model_call_id: "call".into(),
+        })]));
+        let failure = consume_model_cycle(stream, &tx, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(failure.retryable);
+    }
+
+    #[tokio::test]
+    async fn structured_transport_failures_keep_retry_metadata_before_output() {
+        let (tx, _rx) = mpsc::channel(8);
+        let stream = Box::pin(tokio_stream::iter(vec![Err(
+            crate::Error::ProviderResponse {
+                message: "rate limited".into(),
+                retryable: true,
+                retry_after: Some(std::time::Duration::from_secs(7)),
+            },
+        )]));
+        let failure = consume_model_cycle(stream, &tx, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(failure.retryable);
+        assert!(!failure.output_started);
+        assert_eq!(failure.retry_after, Some(std::time::Duration::from_secs(7)));
     }
 
     #[test]
@@ -542,13 +627,13 @@ mod tests {
             None,
         );
         assert!(!unauthorized.retryable);
-        // A status-looking number inside the body is not a status code.
+        // Unstructured messages are terminal; status-looking text is not trusted.
         let body_number = failure(
             RunFailure::Provider("Anthropic 502 Bad Gateway: upstream returned 400".into()),
             String::new(),
             String::new(),
             None,
         );
-        assert!(body_number.retryable);
+        assert!(!body_number.retryable);
     }
 }

@@ -25,10 +25,7 @@ pub struct RunEngine {
     provider: Arc<dyn Provider>,
 }
 
-/// Provider-visible tail appended when the committed history ends with the
-/// assistant, which happens when Cursor resumes a turn that had already
-/// finished (for example after a cancelled follow-up).
-const CONTINUE_MESSAGE_ID: &str = "runtime:continue";
+/// Committed continuation used when Cursor resumes an assistant-terminated turn.
 const CONTINUE_INSTRUCTION: &str = "Continue from where you left off.";
 
 impl RunEngine {
@@ -212,9 +209,11 @@ impl RunEngine {
                     .auto_compact(prepared, checkpoint, &messages, client, cancellation)
                     .await
                 {
-                    Ok((next_checkpoint, compaction_usage)) => {
+                    Ok((next_checkpoint, compaction_usage, compacted)) => {
                         checkpoint = next_checkpoint;
-                        context_usage_anchor = None;
+                        if compacted {
+                            context_usage_anchor = None;
+                        }
                         if let Some(compaction_usage) = compaction_usage {
                             accumulate_usage(&mut usage, compaction_usage);
                         }
@@ -222,6 +221,39 @@ impl RunEngine {
                     }
                     Err(outcome) => return (outcome, usage),
                 }
+            }
+            if prepared.action != RunAction::Compact
+                && history
+                    .last()
+                    .is_some_and(|message| message.role == Role::Assistant)
+            {
+                let event_id = format!("continue:{}:{}", prepared.run_id, checkpoint.0);
+                let mut message = CanonicalMessage::text(
+                    format!("runtime:{event_id}"),
+                    Role::User,
+                    Origin::Runtime,
+                    CONTINUE_INSTRUCTION,
+                );
+                message.runtime_event_id = Some(event_id.clone());
+                let (result, _) = tokio::sync::oneshot::channel();
+                checkpoint = match super::messages::append_batches(
+                    &self.store,
+                    prepared,
+                    client,
+                    cancellation,
+                    checkpoint,
+                    vec![super::MessageBatch {
+                        event_id,
+                        messages: vec![message],
+                        result,
+                    }],
+                )
+                .await
+                {
+                    Ok((checkpoint, _)) => checkpoint,
+                    Err(outcome) => return (outcome, usage),
+                };
+                continue 'model;
             }
             let provider_call_index = match self.store.begin_provider_call(&prepared.run_id).await {
                 Ok(index) => index,
@@ -236,8 +268,6 @@ impl RunEngine {
             if let Err(error) = hydrate_tool_images(&self.store, &mut history).await {
                 return (RunOutcome::Failed(error.into()), usage);
             }
-            // The usage anchor counts persisted messages only; a transient
-            // tail is provider-visible but never committed.
             let anchored_messages = history.len();
             let history = if prepared.action == RunAction::Compact {
                 super::history::user_terminated(
@@ -246,7 +276,7 @@ impl RunEngine {
                     super::compaction::INSTRUCTIONS,
                 )
             } else {
-                super::history::user_terminated(history, CONTINUE_MESSAGE_ID, CONTINUE_INSTRUCTION)
+                history
             };
             let request = crate::model::ModelRequest {
                 prompt: prepared.prompt.clone(),
@@ -401,7 +431,6 @@ impl RunEngine {
                                 checkpoint_id = checkpoint.0,
                                 "provider rejected the prompt as over-limit; compacting and retrying"
                             );
-                            overflow_compacted = true;
                             checkpoint = match super::messages::append_batches(
                                 &self.store,
                                 prepared,
@@ -424,9 +453,12 @@ impl RunEngine {
                                 .auto_compact(prepared, checkpoint, &messages, client, cancellation)
                                 .await
                             {
-                                Ok((next_checkpoint, compaction_usage)) => {
+                                Ok((next_checkpoint, compaction_usage, compacted)) => {
                                     checkpoint = next_checkpoint;
-                                    context_usage_anchor = None;
+                                    overflow_compacted = compacted;
+                                    if compacted {
+                                        context_usage_anchor = None;
+                                    }
                                     if let Some(compaction_usage) = compaction_usage {
                                         accumulate_usage(&mut usage, compaction_usage);
                                     }
@@ -766,7 +798,7 @@ impl RunEngine {
         messages: &[CanonicalMessage],
         client: &mut RunPort,
         cancellation: &CancellationToken,
-    ) -> std::result::Result<(crate::model::CheckpointId, Option<Usage>), RunOutcome> {
+    ) -> std::result::Result<(crate::model::CheckpointId, Option<Usage>, bool), RunOutcome> {
         let current_ids = prepared
             .initial_messages
             .iter()
@@ -795,9 +827,7 @@ impl RunEngine {
             .await
             .map_err(|error| RunOutcome::Failed(error.into()))?;
         let history = crate::model::project_messages(&compactable)
-            .map(|history| {
-                super::compaction::compaction_history(history, prepared.model.context_window_tokens)
-            })
+            .map(super::compaction::compaction_history)
             .map_err(|error| RunOutcome::Failed(error.into()))?;
         let mut model = prepared.model.clone();
         model.max_output_tokens = Some(super::compaction::OUTPUT_TOKENS);
@@ -865,33 +895,43 @@ impl RunEngine {
         };
         drop(silent_events);
         let _ = drain.await;
-        let (summary, compaction_usage) = match (break_messages.is_some(), cycle) {
-            (true, Ok(cycle)) => (
-                super::compaction::fallback_summary(&compactable),
-                cycle.usage,
-            ),
-            (true, Err(failure)) => (
-                super::compaction::fallback_summary(&compactable),
-                failure.usage,
-            ),
-            (false, Ok(cycle)) if cycle.calls.is_empty() && !cycle.text.trim().is_empty() => {
-                (cycle.text.trim().to_string(), cycle.usage)
-            }
-            (false, Ok(cycle)) => {
-                tracing::warn!("automatic compaction returned no usable summary; using fallback");
-                (
-                    super::compaction::fallback_summary(&compactable),
-                    cycle.usage,
-                )
-            }
-            (false, Err(failure)) => {
-                tracing::warn!(error = ?failure.failure, "automatic compaction model failed; using fallback");
-                (
-                    super::compaction::fallback_summary(&compactable),
-                    failure.usage,
-                )
-            }
-        };
+        if cancellation.is_cancelled() {
+            return Err(RunOutcome::Cancelled);
+        }
+        if let Some(messages) = break_messages {
+            let compaction_usage = match cycle {
+                Ok(cycle) => cycle.usage,
+                Err(failure) => failure.usage,
+            };
+            emit(client, RunEvent::CycleInterrupted)
+                .await
+                .map_err(|_| client_failure())?;
+            pending_insertions.push(messages);
+            let checkpoint = super::messages::append_batches(
+                &self.store,
+                prepared,
+                client,
+                cancellation,
+                checkpoint,
+                pending_insertions,
+            )
+            .await?
+            .0;
+            return Ok((checkpoint, compaction_usage, false));
+        }
+        let cycle = cycle.map_err(|failure| RunOutcome::Failed(failure.failure))?;
+        if !cycle.calls.is_empty() {
+            return Err(RunOutcome::Failed(RunFailure::Protocol(
+                "compaction model returned tool calls".into(),
+            )));
+        }
+        let summary = cycle.text.trim().to_string();
+        if summary.is_empty() {
+            return Err(RunOutcome::Failed(RunFailure::Protocol(
+                "compaction model returned an empty summary".into(),
+            )));
+        }
+        let compaction_usage = cycle.usage;
         let event_id = format!("summary:auto:{}:{provider_call_index}", prepared.run_id);
         let summary_message = CanonicalMessage {
             message_id: format!("runtime:{event_id}"),
@@ -911,6 +951,9 @@ impl RunEngine {
             .map_err(|error| RunOutcome::Failed(error.into()))?;
         super::compaction::validate_compacted(prepared, &projected_replacement)
             .map_err(|message| RunOutcome::Failed(RunFailure::Protocol(message)))?;
+        if cancellation.is_cancelled() {
+            return Err(RunOutcome::Cancelled);
+        }
         let mut checkpoint = self
             .store
             .replace_checkpoint(
@@ -950,19 +993,7 @@ impl RunEngine {
         )
         .await?
         .0;
-        if let Some(messages) = break_messages {
-            checkpoint = super::messages::append_batches(
-                &self.store,
-                prepared,
-                client,
-                cancellation,
-                checkpoint,
-                vec![messages],
-            )
-            .await?
-            .0;
-        }
-        Ok((checkpoint, compaction_usage))
+        Ok((checkpoint, compaction_usage, true))
     }
 }
 

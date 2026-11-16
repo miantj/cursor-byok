@@ -14,12 +14,13 @@ use crate::{
             CheckpointBuilder,
         },
         compile::{
-            compile_injection, compile_user_message_action, CursorRunContext, RuntimeAction,
+            compile_injection, compile_request_context, compile_user_message_action,
+            hydrate_action, merge_local_rules, CursorRunContext,
         },
         prompting::PromptCompiler,
         protocol::events,
         protocol::proto::agent::v1 as pb,
-        services::blob_sync::BlobSynchronizer,
+        services::{blob_sync::BlobSynchronizer, context_sync::RequestContextSynchronizer},
         tools::{
             codec, compat,
             runtime::CursorToolRuntime,
@@ -48,9 +49,10 @@ pub struct ConversationOutput {
     results: ToolResultReceiver,
     checkpoint: CheckpointBuilder,
     tool_runtime: CursorToolRuntime,
-    runtime_actions: mpsc::UnboundedReceiver<RuntimeAction>,
+    runtime_actions: mpsc::UnboundedReceiver<pb::ConversationAction>,
     compiler: PromptCompiler,
     blob_sync: BlobSynchronizer,
+    context_sync: RequestContextSynchronizer,
     injection_ids: HashSet<String>,
     pending_injections: HashMap<String, PendingInjection>,
     superseded: CancellationToken,
@@ -58,7 +60,6 @@ pub struct ConversationOutput {
 
 struct PendingInjection {
     user_message: Option<pb::UserMessage>,
-    delivery_batch_id: String,
 }
 
 struct InjectionState<'a> {
@@ -75,9 +76,10 @@ pub(crate) struct ConversationOutputDependencies {
     pub results: ToolResultReceiver,
     pub checkpoint: CheckpointBuilder,
     pub tool_runtime: CursorToolRuntime,
-    pub runtime_actions: mpsc::UnboundedReceiver<RuntimeAction>,
+    pub runtime_actions: mpsc::UnboundedReceiver<pb::ConversationAction>,
     pub compiler: PromptCompiler,
     pub blob_sync: BlobSynchronizer,
+    pub context_sync: RequestContextSynchronizer,
 }
 
 impl ConversationOutput {
@@ -104,6 +106,7 @@ impl ConversationOutput {
             runtime_actions: runtime.runtime_actions,
             compiler: runtime.compiler,
             blob_sync: runtime.blob_sync,
+            context_sync: runtime.context_sync,
             injection_ids: HashSet::new(),
             pending_injections: HashMap::new(),
             superseded: runtime.superseded,
@@ -234,10 +237,18 @@ impl ConversationOutput {
                 Input::CompletionResult(None) => {
                     return Err(Error::Protocol("tool result channel closed".into()));
                 }
-                Input::RuntimeAction(Some(action)) => match *action {
-                    RuntimeAction::Inject(action) => {
+                Input::RuntimeAction(Some(action)) => {
+                    let inject = matches!(
+                        action.action,
+                        Some(pb::conversation_action::Action::InjectContextAction(_))
+                    );
+                    let user = matches!(
+                        action.action,
+                        Some(pb::conversation_action::Action::UserMessageAction(_))
+                    );
+                    if inject {
                         self.forward_injection(
-                            action,
+                            *action,
                             active_round.as_ref(),
                             &active_tool_calls,
                             &completions,
@@ -245,10 +256,9 @@ impl ConversationOutput {
                             &mut interrupted_tool_calls,
                         )
                         .await?;
-                    }
-                    RuntimeAction::UserMessage(action) => {
+                    } else if user {
                         self.forward_user_message(
-                            action,
+                            *action,
                             active_round.as_ref(),
                             &active_tool_calls,
                             &completions,
@@ -256,8 +266,12 @@ impl ConversationOutput {
                             &mut interrupted_tool_calls,
                         )
                         .await?;
+                    } else {
+                        return Err(Error::Protocol(
+                            "unsupported runtime ConversationAction".into(),
+                        ));
                     }
-                },
+                }
                 Input::RuntimeAction(None) => {
                     return Err(Error::Protocol("runtime action channel closed".into()));
                 }
@@ -523,7 +537,7 @@ impl ConversationOutput {
                                     as i64;
                                 self.handle.emit(&events::context_injection_delivered(
                                     injection_id.to_owned(),
-                                    pending.delivery_batch_id.clone(),
+                                    injection_id.to_owned(),
                                     delivered_at_ms,
                                 ))?;
                                 if let Some(user_message) = pending.user_message {
@@ -841,28 +855,38 @@ impl ConversationOutput {
 
     async fn forward_user_message(
         &mut self,
-        action: pb::UserMessageAction,
+        mut action: pb::ConversationAction,
         active_round: Option<&ToolRoundId>,
         active_tool_calls: &HashSet<String>,
         completions: &HashMap<String, ToolCompletion>,
         interrupted_rounds: &mut HashSet<ToolRoundId>,
         interrupted_tool_calls: &mut HashSet<String>,
     ) -> Result<()> {
-        let user_message = action.user_message.clone().ok_or_else(|| {
+        let request_context = self.hydrate_runtime_context(&action).await?;
+        let Some(pb::conversation_action::Action::UserMessageAction(mut typed)) =
+            action.action.take()
+        else {
+            return Err(Error::Protocol(
+                "runtime user message action is missing".into(),
+            ));
+        };
+        let user_message = typed.user_message.clone().ok_or_else(|| {
             Error::Protocol("Cursor user message action has no UserMessage".into())
         })?;
         let injection_id = format!("user-message:{}", user_message.message_id);
-        let message = compile_user_message_action(
-            &action,
+        typed.request_context = Some(request_context.clone());
+        let runtime = compile_user_message_action(
+            &typed,
             self.context.runtime_mode,
             &self.compiler,
             &self.blob_sync,
         )
         .await?;
+        let messages = self.with_context_update(request_context, runtime)?;
         self.queue_injection(
             injection_id,
             Some(user_message),
-            message,
+            messages,
             InjectionState {
                 active_round,
                 active_tool_calls,
@@ -876,50 +900,72 @@ impl ConversationOutput {
 
     async fn forward_injection(
         &mut self,
-        action: pb::InjectContextAction,
+        mut action: pb::ConversationAction,
         active_round: Option<&ToolRoundId>,
         active_tool_calls: &HashSet<String>,
         completions: &HashMap<String, ToolCompletion>,
         interrupted_rounds: &mut HashSet<ToolRoundId>,
         interrupted_tool_calls: &mut HashSet<String>,
     ) -> Result<()> {
-        if action.injection_id.is_empty() {
+        let Some(pb::conversation_action::Action::InjectContextAction(typed)) =
+            action.action.as_ref()
+        else {
+            return Err(Error::Protocol(
+                "runtime inject context action is missing".into(),
+            ));
+        };
+        if typed.injection_id.is_empty() {
             return Err(Error::Protocol(
                 "InjectContextAction has no injection_id".into(),
             ));
         }
-        if self.injection_ids.contains(&action.injection_id) {
+        if self.injection_ids.contains(&typed.injection_id) {
             return Ok(());
         }
-        if action.expected_run_id != self.context.request_id {
+        if typed.expected_run_id != self.context.request_id {
             let reason = format!(
                 "InjectContextAction expected run {}, active run is {}",
-                action.expected_run_id, self.context.request_id
+                typed.expected_run_id, self.context.request_id
             );
             self.handle.emit(&events::context_injection_rejected(
-                action.injection_id.clone(),
+                typed.injection_id.clone(),
                 reason,
             ))?;
-            self.injection_ids.insert(action.injection_id);
+            self.injection_ids.insert(typed.injection_id.clone());
             return Ok(());
         }
-        let user_message = match action.payload.as_ref() {
+        let request_context = self.hydrate_runtime_context(&action).await?;
+        let Some(pb::conversation_action::Action::InjectContextAction(mut typed)) =
+            action.action.take()
+        else {
+            return Err(Error::Protocol(
+                "runtime inject context action is missing".into(),
+            ));
+        };
+        let user_message = match typed.payload.as_ref() {
             Some(pb::inject_context_action::Payload::UserContext(context)) => {
                 context.user_message.clone()
             }
             _ => None,
         };
-        let message = compile_injection(
-            &action,
+        let injection_id = typed.injection_id.clone();
+        if let Some(pb::inject_context_action::Payload::UserContext(context)) =
+            typed.payload.as_mut()
+        {
+            context.request_context = Some(request_context.clone());
+        }
+        let runtime = compile_injection(
+            &typed,
             self.context.runtime_mode,
             &self.compiler,
             &self.blob_sync,
         )
         .await?;
+        let messages = self.with_context_update(request_context, runtime)?;
         self.queue_injection(
-            action.injection_id,
+            injection_id,
             user_message,
-            message,
+            messages,
             InjectionState {
                 active_round,
                 active_tool_calls,
@@ -931,22 +977,56 @@ impl ConversationOutput {
         .await
     }
 
+    async fn hydrate_runtime_context(
+        &self,
+        action: &pb::ConversationAction,
+    ) -> Result<pb::RequestContext> {
+        let mut request_context = hydrate_action(
+            action,
+            &self.context.exec.conversation_id,
+            &self.context_sync,
+        )
+        .await?;
+        if let Some(rules_dir) = self.registry.dependencies().local_rules_dir.as_deref() {
+            merge_local_rules(&mut request_context, rules_dir);
+        }
+        Ok(request_context)
+    }
+
+    fn with_context_update(
+        &mut self,
+        request_context: pb::RequestContext,
+        runtime: crate::model::CanonicalMessage,
+    ) -> Result<Vec<crate::model::CanonicalMessage>> {
+        let event_id = runtime
+            .runtime_event_id
+            .as_deref()
+            .ok_or_else(|| Error::Protocol("runtime message has no event identity".into()))?;
+        let context_message = compile_request_context(
+            event_id,
+            &request_context,
+            &[],
+            self.context.latest_request_context.as_ref(),
+        )?;
+        if let Some(context_message) = context_message.as_ref() {
+            self.context.latest_request_context = Some(context_message.clone());
+        }
+        Ok(context_message
+            .into_iter()
+            .chain(std::iter::once(runtime))
+            .collect())
+    }
+
     async fn queue_injection(
         &mut self,
         injection_id: String,
         user_message: Option<pb::UserMessage>,
-        message: crate::model::CanonicalMessage,
+        messages: Vec<crate::model::CanonicalMessage>,
         state: InjectionState<'_>,
     ) -> Result<()> {
-        let delivery_batch_id = injection_id.clone();
         self.injection_ids.insert(injection_id.clone());
-        self.pending_injections.insert(
-            injection_id.clone(),
-            PendingInjection {
-                user_message,
-                delivery_batch_id,
-            },
-        );
+        self.pending_injections
+            .insert(injection_id.clone(), PendingInjection { user_message });
         self.handle
             .emit(&events::context_injection_queued(injection_id.clone()))?;
         state.interrupted_tool_calls.extend(
@@ -960,9 +1040,9 @@ impl ConversationOutput {
             state.interrupted_rounds.insert(round_id.clone());
         }
         self.interrupt_execs().await;
-        let event_id = message
-            .runtime_event_id
-            .clone()
+        let event_id = messages
+            .last()
+            .and_then(|message| message.runtime_event_id.clone())
             .ok_or_else(|| Error::Protocol("runtime message has no event identity".into()))?;
         let registry = self.registry.clone();
         let conversation_id = ConversationId::new(&self.context.exec.conversation_id);
@@ -973,7 +1053,7 @@ impl ConversationOutput {
                     CompiledMessages {
                         event_id,
                         target_run_id: None,
-                        messages: vec![message],
+                        messages,
                         delivery: MessageDelivery::BreakMessages,
                     },
                 )
@@ -1006,7 +1086,7 @@ enum Input {
     Event(Option<RunEvent>),
     Completion(ToolCompletion),
     CompletionResult(Option<Result<ToolCompletion>>),
-    RuntimeAction(Option<Box<RuntimeAction>>),
+    RuntimeAction(Option<Box<pb::ConversationAction>>),
     CheckpointFailure(Option<Error>),
 }
 
@@ -1059,16 +1139,17 @@ pub(crate) fn finish_failed(handle: &TransportHandle, error: &Error) -> Result<(
         details: Vec::new(),
     };
     let stream_error = match error {
-        Error::Provider(_) | Error::Http(_) => {
+        Error::Provider(_) | Error::ProviderResponse { .. } | Error::Http(_) => {
+            // The run already rejected recovery or exhausted retries; client retries may duplicate visible output.
             let detail = ai::ErrorDetails {
                 error: ai::error_details::Error::ProviderError as i32,
                 details: Some(ai::CustomErrorDetails {
                     title: "Provider Error".into(),
                     detail: error.to_string(),
                     allow_command_links_potentially_unsafe_please_only_use_for_handwritten_trusted_markdown: Some(true),
-                    is_retryable: Some(true),
+                    is_retryable: Some(false),
                     show_request_id: Some(true),
-                    should_show_immediate_error: Some(false),
+                    should_show_immediate_error: Some(true),
                 }),
                 is_expected: Some(true),
             };

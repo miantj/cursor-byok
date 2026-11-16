@@ -51,7 +51,7 @@ async fn abort_command_cancels_the_run_and_closes_output() {
 }
 
 #[tokio::test]
-async fn provider_failure_retries_from_the_current_checkpoint_without_hiding_partial_output() {
+async fn provider_failure_after_visible_output_is_terminal_without_replacing_partial_output() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
     provider.push_results(vec![
@@ -69,7 +69,11 @@ async fn provider_failure_retries_from_the_current_checkpoint_without_hiding_par
             index: 0,
             delta: "{\"path\":".into(),
         }),
-        Err(Error::Provider("stream disconnected".into())),
+        Err(Error::ProviderResponse {
+            message: "stream disconnected".into(),
+            retryable: true,
+            retry_after: None,
+        }),
     ]);
     provider.push(vec![
         ModelEvent::Start {
@@ -103,19 +107,15 @@ async fn provider_failure_retries_from_the_current_checkpoint_without_hiding_par
 
     let mut seqno = 1;
     let mut text = String::new();
-    let mut failed_tool_completed = false;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(60), output.recv())
+    let mut saw_tool_start = false;
+    let error_json = loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
             .await
             .unwrap()
             .unwrap();
         let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
         if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
-                serde_json::json!({})
-            );
-            break;
+            break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
         }
         let server = pb::AgentServerMessage::decode(payload).unwrap();
         match server.message {
@@ -134,39 +134,147 @@ async fn provider_failure_retries_from_the_current_checkpoint_without_hiding_par
                     Some(pb::interaction_update::Message::TextDelta(delta)) => {
                         text.push_str(&delta.text);
                     }
-                    Some(pb::interaction_update::Message::ToolCallCompleted(completed))
-                        if completed.call_id == "failed-tool" =>
-                    {
-                        let tool = completed.tool_call.expect("failed tool completion");
-                        failed_tool_completed = tool.completed_at_ms.is_some();
+                    Some(pb::interaction_update::Message::PartialToolCall(_)) => {
+                        saw_tool_start = true;
                     }
                     _ => {}
                 }
             }
             _ => {}
         }
-    }
+    };
 
-    assert_eq!(text, "partial completed");
-    assert!(
-        failed_tool_completed,
-        "failed attempt must terminate its partial tool card"
-    );
+    assert_eq!(text, "partial ");
+    assert!(saw_tool_start, "partial tool card is user-visible output");
+    assert_eq!(error_json["error"]["code"], "unavailable");
+    let detail = error_json["error"]["details"][0]["value"].as_str().unwrap();
+    let bytes = STANDARD_NO_PAD.decode(detail).unwrap();
+    let details = ai::ErrorDetails::decode(bytes.as_slice()).unwrap();
+    let details = details.details.unwrap();
+    assert_eq!(details.is_retryable, Some(false));
+    assert_eq!(details.should_show_immediate_error, Some(true));
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
+    assert_eq!(
+        requests.len(),
+        1,
+        "visible output must prevent automatic retries"
+    );
     let messages = store
         .load_current_messages(&cursor_server::model::ConversationId::new(
             "protocol-failed-conversation",
         ))
         .await
         .unwrap();
-    assert!(messages.iter().any(|message| {
-        matches!(&message.content, MessageContent::Assistant { text, .. } if text == "completed")
-    }));
+    assert!(
+        !messages
+            .iter()
+            .any(|message| { matches!(&message.content, MessageContent::Assistant { .. }) }),
+        "a failed attempt must not be committed as a completed assistant message"
+    );
     assert!(!messages.iter().any(|message| {
         matches!(&message.content, MessageContent::Assistant { text, .. } if text.contains("partial"))
     }));
+}
+
+#[tokio::test]
+async fn failures_before_visible_output_follow_classification_and_retry_budget() {
+    for (name, retryable, failures, expected_attempts, completed) in [
+        ("terminal", false, 1, 1, false),
+        ("temporary", true, 1, 2, true),
+        ("exhausted", true, 4, 4, false),
+    ] {
+        let (_directory, store) = fixtures::temp_store().await;
+        let provider = fake_provider::FakeProvider::default();
+        for _ in 0..failures {
+            provider.push_error(Error::ProviderResponse {
+                message: format!("{name} provider failure"),
+                retryable,
+                retry_after: None,
+            });
+        }
+        provider.push(vec![
+            ModelEvent::Start {
+                model_call_id: "success".into(),
+            },
+            ModelEvent::TextStart,
+            ModelEvent::TextDelta("completed".into()),
+            ModelEvent::TextEnd,
+            ModelEvent::Done(FinishReason::Stop),
+        ]);
+        let assets = PromptAssets::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("prompt/cursor")
+                .as_path(),
+        )
+        .unwrap();
+        let registry = TransportRegistry::new(
+            store.clone(),
+            Arc::new(provider.clone()),
+            PromptCompiler::new(assets),
+        );
+        let handle = registry.get_or_create(name).await.unwrap();
+        let mut output = handle.subscribe();
+        handle
+            .command(TransportCommand::Append {
+                seqno: 0,
+                message: Box::new(client_run()),
+            })
+            .await
+            .unwrap();
+        let mut seqno = 1;
+        let terminal = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(15), output.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+            if flags & connect::END_STREAM_FLAG != 0 {
+                break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+            }
+            let server = pb::AgentServerMessage::decode(payload).unwrap();
+            if let Some(pb::agent_server_message::Message::KvServerMessage(kv)) = server.message {
+                handle
+                    .command(TransportCommand::Append {
+                        seqno,
+                        message: Box::new(kv_ack(kv.id)),
+                    })
+                    .await
+                    .unwrap();
+                seqno += 1;
+            }
+        };
+        assert_eq!(provider.requests().len(), expected_attempts, "{name}");
+        let requests = provider.requests();
+        assert!(
+            requests.windows(2).all(|pair| pair[0] == pair[1]),
+            "retry must use the same checkpoint"
+        );
+        if completed {
+            assert_eq!(terminal, serde_json::json!({}));
+        } else {
+            assert_eq!(terminal["error"]["code"], "unavailable");
+            let value = terminal["error"]["details"][0]["value"].as_str().unwrap();
+            let bytes = STANDARD_NO_PAD.decode(value).unwrap();
+            let details = ai::ErrorDetails::decode(bytes.as_slice())
+                .unwrap()
+                .details
+                .unwrap();
+            assert_eq!(details.is_retryable, Some(false), "{name}");
+            assert_eq!(details.should_show_immediate_error, Some(true), "{name}");
+        }
+        let (status, summary): (String, Option<String>) =
+            sqlx::query_as("SELECT status, failure_summary FROM runs WHERE cursor_request_id = ?")
+                .bind(name)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            status,
+            if completed { "completed" } else { "failed" },
+            "{name}"
+        );
+        assert_eq!(summary.is_some(), !completed, "{name}");
+    }
 }
 
 #[tokio::test]
@@ -263,8 +371,8 @@ async fn provider_failure_keeps_the_initial_checkpoint_then_returns_structured_e
     assert_eq!(decoded.is_expected, Some(true));
     let custom = decoded.details.unwrap();
     assert_eq!(custom.title, "Provider Error");
-    assert_eq!(custom.is_retryable, Some(true));
-    assert_eq!(custom.should_show_immediate_error, Some(false));
+    assert_eq!(custom.is_retryable, Some(false));
+    assert_eq!(custom.should_show_immediate_error, Some(true));
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(1), output.recv())
             .await

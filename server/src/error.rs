@@ -15,6 +15,12 @@ pub enum Error {
     Protocol(String),
     #[error("provider error: {0}")]
     Provider(String),
+    #[error("provider error: {message}")]
+    ProviderResponse {
+        message: String,
+        retryable: bool,
+        retry_after: Option<std::time::Duration>,
+    },
     #[error("store error: {0}")]
     Store(String),
     #[error("run was cancelled")]
@@ -41,6 +47,24 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+impl Error {
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::ProviderResponse { retryable, .. } => *retryable,
+            Self::Http(error) => error.is_timeout() || error.is_connect() || error.is_body(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn transient_provider(message: impl Into<String>) -> Self {
+        Self::ProviderResponse {
+            message: message.into(),
+            retryable: true,
+            retry_after: None,
+        }
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match self {
@@ -48,7 +72,9 @@ impl IntoResponse for Error {
                 StatusCode::BAD_REQUEST
             }
             Self::RunNotFound(_) => StatusCode::NOT_FOUND,
-            Self::Provider(_) | Self::Http(_) => StatusCode::BAD_GATEWAY,
+            Self::Provider(_) | Self::ProviderResponse { .. } | Self::Http(_) => {
+                StatusCode::BAD_GATEWAY
+            }
             Self::Cancelled => StatusCode::CONFLICT,
             Self::Store(_)
             | Self::Database(_)

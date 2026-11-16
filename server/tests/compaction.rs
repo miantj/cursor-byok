@@ -585,10 +585,9 @@ async fn provider_overflow_refusal_compacts_and_retries_once() {
 }
 
 #[tokio::test]
-async fn assistant_terminated_history_is_sent_with_a_user_tail() {
-    // Cursor can resume a conversation whose committed history already ends
-    // with the assistant. Anthropic refuses that as a prefill, so the run
-    // appends a provider-visible continuation without persisting it.
+async fn assistant_terminated_resume_persists_unique_user_tails_and_preserves_provider_prefixes() {
+    // A resumed assistant tail needs a committed continuation before dispatch.
+    // Otherwise the following turn silently drops a provider-visible message.
     let (_directory, store) = fixtures::temp_store().await;
     let model = store
         .create_model(&windowed_model("tail-model", None))
@@ -597,6 +596,8 @@ async fn assistant_terminated_history_is_sent_with_a_user_tail() {
     let provider = fake_provider::FakeProvider::default();
     provider.push(text_response("first answer", 400, 12));
     provider.push(text_response("resumed answer", 450, 12));
+    provider.push(text_response("next answer", 500, 12));
+    provider.push(text_response("resumed again", 550, 12));
     let assets = PromptAssets::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("prompt/cursor")
@@ -633,30 +634,63 @@ async fn assistant_terminated_history_is_sent_with_a_user_tail() {
     )
     .await;
     assert_eq!(resumed.turn_ended, 1);
+    let after = run(
+        &registry,
+        "tail-after",
+        user_request(
+            "tail-conversation",
+            "tail-user-2",
+            "follow up after resuming",
+            &model.model_hash,
+            resumed.checkpoints.last().cloned(),
+        ),
+    )
+    .await;
+    let resumed_again = run(
+        &registry,
+        "tail-resume-again",
+        request(
+            "tail-conversation",
+            &model.model_hash,
+            after.checkpoints.last().cloned(),
+            pb::conversation_action::Action::ResumeAction(pb::ResumeAction::default()),
+        ),
+    )
+    .await;
+    assert_eq!(resumed_again.turn_ended, 1);
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
+    for pair in requests.windows(2) {
+        assert!(
+            pair[1].history.starts_with(&pair[0].history),
+            "every provider request, including its continuation, must remain an exact prefix"
+        );
+    }
     let tail = requests[1].history.last().unwrap();
+    let next_tail = requests[3].history.last().unwrap();
     assert_eq!(tail.role, Role::User);
-    assert_eq!(tail.message_id, "runtime:continue");
-    assert_eq!(
-        requests[1].history[..requests[1].history.len() - 1]
-            .iter()
-            .map(|message| message.message_id.as_str())
-            .collect::<Vec<_>>()
-            .len(),
-        requests[0].history.len() + 1,
-        "committed history plus the first answer, then the transient tail"
-    );
+    assert_eq!(next_tail.role, Role::User);
+    assert!(tail.message_id.starts_with("runtime:continue:"));
+    assert!(next_tail.message_id.starts_with("runtime:continue:"));
+    assert_ne!(tail.message_id, next_tail.message_id);
     let stored = store
         .load_current_messages(&ConversationId::new("tail-conversation"))
         .await
         .unwrap();
-    assert!(
-        stored
+    for continuation in [tail, next_tail] {
+        let message = stored
             .iter()
-            .all(|message| message.message_id != "runtime:continue"),
-        "the continuation tail is provider-visible only and never persisted"
+            .find(|message| message.message_id == continuation.message_id)
+            .expect("a provider-visible continuation must be persisted");
+        assert_eq!(
+            message.runtime_event_id.as_deref(),
+            continuation.message_id.strip_prefix("runtime:")
+        );
+    }
+    assert_eq!(
+        cursor_server::model::project_messages(&stored[..stored.len() - 1]).unwrap(),
+        requests[3].history
     );
 }
 

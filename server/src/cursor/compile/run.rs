@@ -45,6 +45,7 @@ pub struct CursorRunContext {
     pub checkpoint_prompt: PromptSpec,
     pub compacting: bool,
     pub background_completion: bool,
+    pub latest_request_context: Option<CanonicalMessage>,
 }
 
 pub(crate) struct PrepareDependencies<'a> {
@@ -91,17 +92,13 @@ pub(crate) async fn prepare(
                 let mut tool_call_ids = Vec::new();
                 let mut agent_or_task_ids = Vec::new();
                 for completion in &action.completions {
-                    if let Some(tool_call_id) = completion
-                        .tool_call_id
-                        .as_ref()
-                        .filter(|id| !id.is_empty())
+                    if let Some(tool_call_id) =
+                        completion.tool_call_id.as_ref().filter(|id| !id.is_empty())
                     {
                         tool_call_ids.push(tool_call_id.clone());
                     }
-                    if let Some(subagent_id) = completion
-                        .subagent_id
-                        .as_ref()
-                        .filter(|id| !id.is_empty())
+                    if let Some(subagent_id) =
+                        completion.subagent_id.as_ref().filter(|id| !id.is_empty())
                     {
                         agent_or_task_ids.push(subagent_id.clone());
                     }
@@ -255,12 +252,21 @@ pub(crate) async fn prepare(
         }
         None => proposed_base_checkpoint_id,
     };
+    let loaded_history = match &base_messages {
+        Some(_) => None,
+        None => Some(store.load_checkpoint_messages(base_checkpoint_id).await?),
+    };
+    let context_history = base_messages
+        .as_deref()
+        .or(loaded_history.as_deref())
+        .unwrap_or_default();
     let mut projected_user_context = if input_id.is_some() && !compacting && !background_completion
     {
         break_messages::compile_request_context(
             "identity",
             &request_context,
-            base_messages.as_deref().unwrap_or_default(),
+            context_history,
+            None,
         )?
     } else {
         None
@@ -298,18 +304,27 @@ pub(crate) async fn prepare(
             match store.message(&conversation_id, &message_id).await? {
                 Some(message) => Some(message),
                 None if input_id.is_some() => projected_user_context.take().map(|mut message| {
-                    message.message_id = message_id;
+                    message.message_id = message_id.clone();
+                    message.runtime_event_id = Some(message_id);
                     message
                 }),
                 None => break_messages::compile_request_context(
                     event_id,
                     &request_context,
-                    base_messages.as_deref().unwrap_or_default(),
+                    context_history,
+                    None,
                 )?,
             }
         }
         _ => None,
     };
+    let latest_request_context = request_context_message.clone().or_else(|| {
+        context_history
+            .iter()
+            .rev()
+            .find(|message| message.message_id.starts_with("request-context:"))
+            .cloned()
+    });
     let mut initial_messages = if compacting {
         Vec::new()
     } else {
@@ -356,6 +371,7 @@ pub(crate) async fn prepare(
                     .chain(std::iter::once(runtime))
                     .collect()
             }
+            (None, Some(_)) => request_context_message.into_iter().collect(),
             (None, None) => Vec::new(),
             _ => {
                 return Err(Error::Protocol(
@@ -424,6 +440,7 @@ pub(crate) async fn prepare(
             checkpoint_prompt,
             compacting,
             background_completion,
+            latest_request_context,
         },
     ))
 }
@@ -576,6 +593,16 @@ fn action(
             input_id: None,
             starts_turn: false,
             compacting: true,
+            background_completion: false,
+        }),
+        pb::conversation_action::Action::ResumeAction(_) => Ok(ActionProjection {
+            mode,
+            turn_user: None,
+            action_context: String::new(),
+            event_id: Some(format!("resume:{request_id}")),
+            input_id: None,
+            starts_turn: false,
+            compacting: false,
             background_completion: false,
         }),
         _ => Ok(ActionProjection {

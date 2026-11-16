@@ -268,7 +268,7 @@ impl Provider for AnthropicProvider {
                 yield ModelEvent::Done(finish);
             }
             if !terminal {
-                Err(Error::Provider("Anthropic stream ended without message_stop".into()))?;
+                Err(Error::transient_provider("Anthropic stream ended without message_stop"))?;
             }
         })
     }

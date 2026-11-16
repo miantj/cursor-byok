@@ -34,14 +34,36 @@ where
         return Ok(Attempt::Response(response));
     }
     let status = response.status();
-    let bytes = tokio::select! {
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after);
+    let body = tokio::select! {
         _ = cancellation.cancelled() => return Ok(Attempt::Cancelled),
-        bytes = response.bytes() => bytes,
-    }?;
-    Err(Error::Provider(format!(
-        "{label} {status}: {}",
-        String::from_utf8_lossy(&bytes)
-    )))
+        bytes = response.bytes() => match bytes {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => format!("could not read error response body: {error}"),
+        },
+    };
+    let value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    Err(Error::ProviderResponse {
+        message: format!("{label} {status}: {body}"),
+        retryable: super::retryable_provider_response(Some(status), &value),
+        retry_after,
+    })
+}
+
+fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let until = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        (until.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]
@@ -70,7 +92,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, Error::Provider(message) if message.contains("503") && message.contains("down"))
+            matches!(error, Error::ProviderResponse { message, retryable: true, .. } if message.contains("503") && message.contains("down"))
         );
     }
 
@@ -82,7 +104,65 @@ mod tests {
         let error = send_once("test", || client.get(&url), &CancellationToken::new(), None)
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::Http(_)));
+        assert!(matches!(
+            error,
+            Error::ProviderResponse {
+                retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_status_stays_terminal_when_reading_its_body_fails() {
+        let url = server(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 100\r\n\r\nshort").await;
+        let client = reqwest::Client::new();
+        let error = send_once("test", || client.get(&url), &CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ProviderResponse {
+                retryable: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_is_retained_for_the_run_policy() {
+        let url = server(
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let error = send_once("test", || client.get(&url), &CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ProviderResponse {
+            retryable: true,
+            retry_after: Some(value),
+            ..
+        } if value == std::time::Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        assert_eq!(
+            parse_retry_after("12"),
+            Some(std::time::Duration::from_secs(12))
+        );
+        assert_eq!(parse_retry_after("bad header"), None);
+        assert_eq!(parse_retry_after("-1"), None);
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(std::time::Duration::ZERO)
+        );
+        let date = (chrono::Utc::now() + chrono::Duration::seconds(30))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let delay = parse_retry_after(&date).unwrap();
+        assert!((28..=30).contains(&delay.as_secs()));
     }
 
     #[tokio::test]

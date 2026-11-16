@@ -190,6 +190,15 @@ pub async fn append(
     request: DecodedAppend,
     parent: Option<TransportParent>,
 ) -> Result<ai::BidiAppendResponse> {
+    if request.conversation_id().is_some_and(str::is_empty) {
+        return Err(Error::Protocol("Cursor conversation id is required".into()));
+    }
+    if parent
+        .as_ref()
+        .is_some_and(|parent| parent.request_id.is_empty() || parent.tool_call_id.is_empty())
+    {
+        return Err(Error::Protocol("Cursor parent ids are required".into()));
+    }
     let replace_closing = request.model_id().is_some();
     let handle = registry
         .get_or_create_for_append(&request.request_id, replace_closing)

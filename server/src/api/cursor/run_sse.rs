@@ -21,12 +21,11 @@ use crate::{
 
 pub async fn stream(registry: &TransportRegistry, request_id: &str) -> Result<Response<Body>> {
     let handle = registry.get_or_create(request_id).await?;
-    let receiver = handle.subscribe();
     let trace = handle.trace().cloned();
+    let body_stream = local_body_stream(handle, trace.clone())?;
     if let Some(trace) = &trace {
         trace.response_started(StatusCode::OK.as_u16());
     }
-    let body_stream = local_body_stream(receiver, handle, trace);
     let mut response = Response::new(Body::from_stream(body_stream));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
@@ -43,12 +42,12 @@ pub async fn stream(registry: &TransportRegistry, request_id: &str) -> Result<Re
 }
 
 fn local_body_stream(
-    mut receiver: mpsc::UnboundedReceiver<Bytes>,
     handle: TransportHandle,
     trace: Option<CursorTraceRecorder>,
-) -> impl tokio_stream::Stream<Item = std::result::Result<Bytes, Infallible>> {
-    async_stream::stream! {
-        let mut guard = LocalRunGuard::new(handle);
+) -> Result<impl tokio_stream::Stream<Item = std::result::Result<Bytes, Infallible>>> {
+    let mut receiver = handle.subscribe_run_sse()?;
+    let mut guard = LocalRunGuard::new(handle);
+    Ok(async_stream::stream! {
         let mut trace = TraceStreamSink::new(trace, "byok_server");
         while let Some(chunk) = receiver.recv().await {
             let terminal = is_end_stream_frame(&chunk);
@@ -64,7 +63,7 @@ fn local_body_stream(
         }
         guard.complete();
         trace.finish(None);
-    }
+    })
 }
 
 fn is_end_stream_frame(frame: &Bytes) -> bool {
@@ -117,7 +116,7 @@ impl LocalRunGuard {
 
 impl Drop for LocalRunGuard {
     fn drop(&mut self) {
-        if !self.completed {
+        if self.handle.unsubscribe_run_sse(self.completed) {
             let handle = self.handle.clone();
             tokio::spawn(async move {
                 handle.disconnect().await;
@@ -133,6 +132,7 @@ pub async fn upstream(
     response: Response<Body>,
     trace: Option<CursorTraceRecorder>,
 ) -> Result<Response<Body>> {
+    registry.subscribe_upstream(&request_id, generation)?;
     let guard = UpstreamRunGuard {
         registry: registry.clone(),
         request_id: request_id.clone(),
@@ -311,6 +311,229 @@ struct UpstreamRunGuard {
 impl Drop for UpstreamRunGuard {
     fn drop(&mut self) {
         self.registry
-            .finish_upstream(self.request_id.clone(), self.generation);
+            .unsubscribe_upstream(&self.request_id, self.generation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use crate::{
+        cursor::{
+            conversation::TransportCommand,
+            prompting::{PromptAssets, PromptCompiler},
+            transport::{OutputHub, TransportRoute},
+        },
+        model::ModelInvocation,
+        provider::{Provider, ProviderStream},
+        store::Store,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    struct UnusedProvider;
+
+    impl Provider for UnusedProvider {
+        fn stream(&self, _: ModelInvocation, _: CancellationToken) -> ProviderStream {
+            panic!("transport tests must not start a provider")
+        }
+    }
+
+    async fn registry() -> (tempfile::TempDir, TransportRegistry) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        let assets = PromptAssets::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("prompt/cursor")
+                .as_path(),
+        )
+        .unwrap();
+        (
+            directory,
+            TransportRegistry::new(store, Arc::new(UnusedProvider), PromptCompiler::new(assets)),
+        )
+    }
+
+    async fn local_handle() -> (
+        tempfile::TempDir,
+        TransportHandle,
+        mpsc::Receiver<TransportCommand>,
+    ) {
+        let (directory, registry) = registry().await;
+        let (commands, receiver) = mpsc::channel(8);
+        let handle = TransportHandle::new(
+            "body-drop".into(),
+            commands,
+            Arc::new(OutputHub::default()),
+            registry.trace("body-drop"),
+        );
+        (directory, handle, receiver)
+    }
+
+    fn local_body(handle: TransportHandle) -> Body {
+        Body::from_stream(local_body_stream(handle, None).unwrap())
+    }
+
+    #[tokio::test]
+    async fn dropping_polled_overlapping_http_bodies_disconnects_only_once() {
+        for newest_first in [false, true] {
+            let (_directory, handle, mut commands) = local_handle().await;
+            let mut first = local_body(handle.clone()).into_data_stream();
+            let mut second = local_body(handle.clone()).into_data_stream();
+            handle.emit_frame(Bytes::from_static(b"\0first"));
+            assert_eq!(first.next().await.unwrap().unwrap(), b"\0first"[..]);
+            assert_eq!(second.next().await.unwrap().unwrap(), b"\0first"[..]);
+            let (first, mut second) = if newest_first {
+                (second, first)
+            } else {
+                (first, second)
+            };
+
+            drop(first);
+            handle.emit_frame(Bytes::from_static(b"\0second"));
+            assert_eq!(second.next().await.unwrap().unwrap(), b"\0second"[..]);
+            drop(second);
+            drop(handle);
+
+            let mut disconnects = 0;
+            while let Some(command) = tokio::time::timeout(Duration::from_secs(2), commands.recv())
+                .await
+                .unwrap()
+            {
+                assert!(matches!(command, TransportCommand::Disconnect));
+                disconnects += 1;
+            }
+            assert_eq!(disconnects, 1, "only the final HTTP body owns cancellation");
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_http_body_disconnects() {
+        let (_directory, handle, mut commands) = local_handle().await;
+        drop(local_body(handle.clone()));
+        drop(handle);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), commands.recv())
+                .await
+                .unwrap(),
+            Some(TransportCommand::Disconnect)
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_http_body_drop_closes_subscription_admission_before_disconnect_is_read() {
+        let (_directory, handle, mut commands) = local_handle().await;
+        drop(local_body(handle.clone()));
+        assert!(local_body_stream(handle.clone(), None).is_err());
+        assert!(matches!(
+            commands.recv().await,
+            Some(TransportCommand::Disconnect)
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_http_body_does_not_disconnect() {
+        let (_directory, handle, mut commands) = local_handle().await;
+        let mut body = local_body(handle.clone()).into_data_stream();
+        handle.emit_frame(connect::encode_end_stream());
+        assert!(is_end_stream_frame(&body.next().await.unwrap().unwrap()));
+        drop(body);
+        drop(handle);
+        assert!(commands.recv().await.is_none());
+    }
+
+    fn upstream_body() -> Response<Body> {
+        Response::new(Body::from_stream(
+            tokio_stream::once(Ok::<_, Infallible>(Bytes::from_static(b"first")))
+                .chain(futures_util::stream::pending()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn dropping_old_upstream_http_body_preserves_the_current_route() {
+        let (_directory, registry) = registry().await;
+        let request_id = "upstream-overlap";
+        registry.mark_upstream(request_id, None).await;
+        let TransportRoute::Upstream(generation) = registry.wait_route(request_id).await else {
+            panic!("expected upstream route");
+        };
+        let mut first = upstream(
+            registry.clone(),
+            request_id.into(),
+            generation,
+            upstream_body(),
+            None,
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .into_data_stream();
+        let mut second = upstream(
+            registry.clone(),
+            request_id.into(),
+            generation,
+            upstream_body(),
+            None,
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .into_data_stream();
+        first.next().await.unwrap().unwrap();
+        second.next().await.unwrap().unwrap();
+        drop(first);
+        assert!(
+            registry.upstream(request_id).await,
+            "new HTTP body still owns the route"
+        );
+        drop(second);
+        assert!(!registry.upstream(request_id).await);
+    }
+
+    #[tokio::test]
+    async fn dropping_old_upstream_generation_cannot_remove_a_replacement_route() {
+        let (_directory, registry) = registry().await;
+        let request_id = "upstream-replacement";
+        registry.mark_upstream(request_id, None).await;
+        let TransportRoute::Upstream(first_generation) = registry.wait_route(request_id).await
+        else {
+            panic!("expected upstream route");
+        };
+        let first = upstream(
+            registry.clone(),
+            request_id.into(),
+            first_generation,
+            upstream_body(),
+            None,
+        )
+        .await
+        .unwrap();
+        registry.finish_upstream(request_id.into(), first_generation);
+        registry.mark_upstream(request_id, None).await;
+        let TransportRoute::Upstream(second_generation) = registry.wait_route(request_id).await
+        else {
+            panic!("expected replacement upstream route");
+        };
+        assert_ne!(first_generation, second_generation);
+        let second = upstream(
+            registry.clone(),
+            request_id.into(),
+            second_generation,
+            upstream_body(),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(first);
+        assert!(registry.upstream(request_id).await);
+        drop(second);
+        assert!(!registry.upstream(request_id).await);
     }
 }

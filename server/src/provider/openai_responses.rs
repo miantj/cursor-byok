@@ -267,7 +267,7 @@ impl Provider for OpenAiResponsesProvider {
                 yield ModelEvent::Done(if saw_tool { FinishReason::ToolUse } else { FinishReason::Stop });
             }
             if !terminal {
-                Err(Error::Provider("OpenAI Responses stream ended without response.completed or response.incomplete".into()))?;
+                Err(Error::transient_provider("OpenAI Responses stream ended without response.completed or response.incomplete"))?;
             }
         })
     }

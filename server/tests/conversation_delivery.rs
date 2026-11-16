@@ -737,11 +737,11 @@ async fn drive_stream(
                 turn_ended += 1;
             }
             Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
-                assert_eq!(exec.id, 0);
                 assert!(matches!(
                     exec.message,
                     Some(pb::exec_server_message::Message::RequestContextArgs(_))
                 ));
+                let context_id = exec.id;
                 handle
                     .command(TransportCommand::Append {
                         seqno: append_seqno,
@@ -751,7 +751,7 @@ async fn drive_stream(
                                     pb::ExecClientControlMessage {
                                         message: Some(
                                             pb::exec_client_control_message::Message::StreamClose(
-                                                pb::ExecClientStreamClose { id: 0 },
+                                                pb::ExecClientStreamClose { id: context_id },
                                             ),
                                         ),
                                     },
@@ -768,7 +768,7 @@ async fn drive_stream(
                         message: Box::new(pb::AgentClientMessage {
                             message: Some(pb::agent_client_message::Message::ExecClientMessage(
                                 pb::ExecClientMessage {
-                                    id: 0,
+                                    id: context_id,
                                     message: Some(
                                         pb::exec_client_message::Message::RequestContextResult(
                                             pb::RequestContextResult {
