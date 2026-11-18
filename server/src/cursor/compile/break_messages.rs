@@ -236,13 +236,14 @@ pub(crate) fn compile_request_context(
     if text.is_empty() {
         return Ok(None);
     }
-    let mut message = CanonicalMessage::text(
+    let message = CanonicalMessage::text(
         format!("request-context:{event_id}"),
         Role::User,
         Origin::Prompt,
         text,
     );
-    message.runtime_event_id = Some(format!("request-context:{event_id}"));
+    // Checkpoint hydration identifies this message by its wire id and does not
+    // preserve an internal runtime event id.
     Ok(should_project_request_context(history, latest, &message).then_some(message))
 }
 

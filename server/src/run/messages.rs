@@ -65,11 +65,20 @@ async fn append_one(
     checkpoint: CheckpointId,
     message: CanonicalMessage,
 ) -> Result<(CheckpointId, bool), RunOutcome> {
-    let event_id = message.runtime_event_id.clone().ok_or_else(|| {
-        RunOutcome::Failed(RunFailure::Protocol(
-            "runtime message has no event identity".into(),
-        ))
-    })?;
+    let event_id = message
+        .runtime_event_id
+        .clone()
+        .or_else(|| {
+            message
+                .message_id
+                .starts_with("request-context:")
+                .then(|| message.message_id.clone())
+        })
+        .ok_or_else(|| {
+            RunOutcome::Failed(RunFailure::Protocol(
+                "runtime message has no event identity".into(),
+            ))
+        })?;
     let (checkpoint, inserted) = store
         .append_message_once(
             &prepared.conversation_id,

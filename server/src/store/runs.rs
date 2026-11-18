@@ -266,6 +266,40 @@ impl Store {
             .ok_or_else(|| Error::Store(format!("run is not active: {run_id}")))
     }
 
+    pub(crate) async fn fail_abandoned_runs(&self) -> Result<()> {
+        let _write = self.writes.lock().await;
+        let now = now_ms();
+        sqlx::query(
+            "UPDATE llm_calls SET status = 'error', finished_at_ms = ?,
+             duration_ms = MAX(0, ? - created_at_ms),
+             error_kind = 'process',
+             error_message = 'server stopped while the call was still active'
+             WHERE status = 'running'
+               AND run_id IN (SELECT run_id FROM runs WHERE status = 'running')",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE conversations SET active_run_id = NULL, updated_at_ms = ?
+             WHERE active_run_id IN (SELECT run_id FROM runs WHERE status = 'running')",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE runs SET status = 'failed', failure_category = 'process',
+             failure_summary = 'server stopped while the run was still active',
+             updated_at_ms = ?
+             WHERE status = 'running'",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn finish_run(
         &self,
         run_id: &RunId,
@@ -496,11 +530,7 @@ mod tests {
 
         // Shell/Await may continue as the owning run when no subagent matches.
         let by_shell = store
-            .run_kind_for_background_completion(
-                &conversation,
-                &["shell-call".into()],
-                &[],
-            )
+            .run_kind_for_background_completion(&conversation, &["shell-call".into()], &[])
             .await
             .unwrap();
         assert_eq!(by_shell, Some(RunKind::Root));
@@ -516,5 +546,52 @@ mod tests {
                 ..
             }) if id == "other-task"
         ));
+    }
+
+    #[tokio::test]
+    async fn connecting_fails_runs_left_active_by_a_stopped_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+        let conversation = ConversationId::new("conversation");
+        let checkpoint = store.ensure_conversation(&conversation).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (run_id, conversation_id, base_checkpoint_id, head_checkpoint_id,
+             run_kind, status, created_at_ms, updated_at_ms)
+             VALUES ('abandoned', 'conversation', ?, ?, 'root', 'running', 1, 1)",
+        )
+        .bind(checkpoint.0)
+        .bind(checkpoint.0)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET active_run_id = 'abandoned' WHERE conversation_id = 'conversation'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        drop(store);
+
+        let store = Store::connect(&url).await.unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM runs WHERE run_id = 'abandoned'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        let summary: String =
+            sqlx::query_scalar("SELECT failure_summary FROM runs WHERE run_id = 'abandoned'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        let active: Option<String> = sqlx::query_scalar(
+            "SELECT active_run_id FROM conversations WHERE conversation_id = 'conversation'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(summary, "server stopped while the run was still active");
+        assert_eq!(active, None);
     }
 }

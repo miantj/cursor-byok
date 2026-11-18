@@ -30,10 +30,12 @@ impl Store {
             .connect_with(options)
             .await?;
         migrations::run(&pool, &database_path).await?;
-        Ok(Self {
+        let store = Self {
             pool,
             writes: WriteCoordinator::default(),
-        })
+        };
+        store.fail_abandoned_runs().await?;
+        Ok(store)
     }
 
     pub fn pool(&self) -> &SqlitePool {

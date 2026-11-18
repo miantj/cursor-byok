@@ -733,13 +733,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
     };
     // Effort 与上下文档位由宿主统一提供,与内置模型一致;插件不再声明这两项。
     let contexts = context_options(None);
-    let variants = model_variants(
-        &model.id,
-        &model.display_name,
-        &tooltip,
-        &contexts,
-        true,
-    );
+    let variants = model_variants(&model.id, &model.display_name, &tooltip, &contexts, true);
     let legacy_slugs = variants
         .iter()
         .filter_map(|variant| variant.legacy_slug.clone())
@@ -934,9 +928,7 @@ mod tests {
         let models = vec![xhigh.clone(), high];
         assert_eq!(default_model_id(&models, &[], None), "high-model");
         assert_eq!(
-            default_model_details(&models, &[], None)
-                .unwrap()
-                .model_id,
+            default_model_details(&models, &[], None).unwrap().model_id,
             "high-model"
         );
         assert_eq!(default_model_id(&[xhigh], &[], None), "xhigh-model");

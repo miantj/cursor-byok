@@ -222,6 +222,21 @@ impl ConversationRuntime {
                                     Some(pb::agent_client_message::Message::RunRequest(
                                         request,
                                     )) => {
+                                        let conversation_id =
+                                            request.conversation_id.clone().unwrap_or_default();
+                                        let message_id = turn_user_message_id(&request);
+                                        let rejected = !conversation_id.is_empty()
+                                            && registry
+                                                .user_stop_rejects(
+                                                    &conversation_id,
+                                                    message_id.as_deref(),
+                                                )
+                                                .await;
+                                        // The stopping stream still has to finish as canceled.
+                                        // A new connection has no generation yet and must answer this replay.
+                                        if rejected && (draining || current.is_some()) {
+                                            continue;
+                                        }
                                         waiting_for_action = false;
                                         if draining {
                                             handle.reopen();
@@ -465,6 +480,22 @@ impl ConversationRuntime {
                                         Some(pb::conversation_action::Action::CancelAction(_)) => {
                                             if let Some(generation) = current.as_ref() {
                                                 let run = generation.run.lock().clone();
+                                                if run.is_some() || !waiting_for_action {
+                                                    if let Some(conversation_id) = generation
+                                                        .request
+                                                        .conversation_id
+                                                        .as_deref()
+                                                    {
+                                                        registry
+                                                            .note_user_stop(
+                                                                conversation_id,
+                                                                turn_user_message_id(
+                                                                    &generation.request,
+                                                                ),
+                                                            )
+                                                            .await;
+                                                    }
+                                                }
                                                 if let Some(run) = run {
                                                     run.cancel();
                                                 } else if !waiting_for_action {
@@ -610,6 +641,15 @@ async fn start_generation(
         result_receiver,
         runtime_action_receiver,
     );
+}
+
+fn turn_user_message_id(request: &pb::AgentRunRequest) -> Option<String> {
+    let action = request.action.as_ref()?.action.as_ref()?;
+    let pb::conversation_action::Action::UserMessageAction(action) = action else {
+        return None;
+    };
+    let id = action.user_message.as_ref()?.message_id.clone();
+    (!id.is_empty()).then_some(id)
 }
 
 fn finish_pending(
@@ -789,6 +829,31 @@ fn spawn_run_request(
         }
         if generation.superseded.is_cancelled() {
             return;
+        }
+
+        let turn_message_id = turn_user_message_id(&request);
+        if registry
+            .user_stop_rejects(
+                prepared.conversation_id.as_str(),
+                turn_message_id.as_deref(),
+            )
+            .await
+        {
+            if !generation.superseded.is_cancelled() {
+                let _ = handle.emit(&crate::cursor::protocol::events::turn_ended(None));
+                let _ = handle
+                    .command(TransportCommand::RunFinished {
+                        generation: generation.id,
+                        finish: RunFinish::TurnCompleted,
+                    })
+                    .await;
+            }
+            return;
+        }
+        if turn_message_id.is_some() {
+            registry
+                .clear_user_stop(prepared.conversation_id.as_str())
+                .await;
         }
 
         let run_id = prepared.run_id.clone();

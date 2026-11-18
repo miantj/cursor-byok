@@ -610,7 +610,7 @@ impl ConversationOutput {
                                 .map_err(|_| Error::Protocol("checkpoint worker closed".into()))?;
                             match receiver
                                 .await
-                                .map_err(|_| Error::Protocol("checkpoint worker stopped".into()))?
+                                .map_err(|_| pending_checkpoint_error(&mut worker.failures))?
                             {
                                 Ok(checkpoint) => {
                                     context_tokens = checkpoint_context_tokens(&checkpoint);
@@ -646,7 +646,7 @@ impl ConversationOutput {
                                 .map_err(|_| Error::Protocol("checkpoint worker closed".into()))?;
                             match receiver
                                 .await
-                                .map_err(|_| Error::Protocol("checkpoint worker stopped".into()))?
+                                .map_err(|_| pending_checkpoint_error(&mut worker.failures))?
                             {
                                 Ok(checkpoints) => {
                                     final_checkpoint = Some(checkpoints);
@@ -690,7 +690,7 @@ impl ConversationOutput {
                                 .map_err(|_| Error::Protocol("checkpoint worker closed".into()))?;
                             let result = published
                                 .await
-                                .map_err(|_| Error::Protocol("checkpoint worker stopped".into()))?
+                                .map_err(|_| pending_checkpoint_error(&mut worker.failures))?
                                 .map_err(Error::Protocol);
                             match result {
                                 Ok(()) => state.barrier.complete(Ok(())),
@@ -739,9 +739,7 @@ impl ConversationOutput {
                             if requires_ready {
                                 let result = published
                                     .await
-                                    .map_err(|_| {
-                                        Error::Protocol("checkpoint worker stopped".into())
-                                    })?
+                                    .map_err(|_| pending_checkpoint_error(&mut worker.failures))?
                                     .map_err(Error::Protocol);
                                 match result {
                                     Ok(()) => state.barrier.complete(Ok(())),
@@ -1118,6 +1116,13 @@ fn accept_tool_completion(
             Ok(false)
         }
         CommandResult::StaleTarget => Err(Error::RunNotFound(request_id.into())),
+    }
+}
+
+fn pending_checkpoint_error(failures: &mut mpsc::Receiver<Error>) -> Error {
+    match failures.try_recv() {
+        Ok(error) => error,
+        Err(_) => Error::Protocol("checkpoint worker stopped".into()),
     }
 }
 

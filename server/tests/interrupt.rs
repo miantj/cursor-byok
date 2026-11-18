@@ -423,6 +423,124 @@ async fn runtime_cancel_action_aborts_active_exec_before_canceled_end_stream() {
 }
 
 #[tokio::test]
+async fn cancelled_user_message_is_not_run_again_until_a_new_message() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    provider.push_pending();
+    provider.push(text_response("continued"));
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(provider.clone()),
+        PromptCompiler::new(PromptAssets::embedded().unwrap()),
+    );
+    let handle = registry.get_or_create("stop-replay-request").await.unwrap();
+    let mut output = handle.subscribe();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(client_run_with_message(
+                "stop-replay-request",
+                "stop-replay-conversation",
+                "same-user",
+            )),
+        })
+        .await
+        .unwrap();
+    let mut append_seqno = 1;
+    let started = tokio::time::Instant::now();
+    while provider.requests().len() < 1 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "provider was not called"
+        );
+        if let Ok(frame) = output.try_recv() {
+            let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+            assert_eq!(
+                flags & connect::END_STREAM_FLAG,
+                0,
+                "run ended before the provider call: {}",
+                String::from_utf8_lossy(&payload)
+            );
+            acknowledge_kv(&handle, &mut append_seqno, &frame).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    handle
+        .command(TransportCommand::Append {
+            seqno: append_seqno,
+            message: Box::new(runtime_cancel_action()),
+        })
+        .await
+        .unwrap();
+    expect_cancelled_output(&mut output).await;
+
+    let replay = registry.get_or_create("stop-replay-again").await.unwrap();
+    let mut replay_output = replay.subscribe();
+    replay
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(client_run_with_message(
+                "stop-replay-again",
+                "stop-replay-conversation",
+                "same-user",
+            )),
+        })
+        .await
+        .unwrap();
+    let mut replay_seqno = 1;
+    let replay_end = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let frame = replay_output.recv().await.expect("replay stream closed");
+            let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+            if flags & connect::END_STREAM_FLAG != 0 {
+                let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                assert!(
+                    json.get("error").is_none(),
+                    "replay must end without an error"
+                );
+                break;
+            }
+            acknowledge_kv(&replay, &mut replay_seqno, &frame).await;
+        }
+    })
+    .await;
+    assert!(replay_end.is_ok(), "replay did not finish");
+    assert_eq!(provider.requests().len(), 1);
+
+    let next = registry.get_or_create("stop-replay-next").await.unwrap();
+    let mut next_output = next.subscribe();
+    next.command(TransportCommand::Append {
+        seqno: 0,
+        message: Box::new(client_run_with_message(
+            "stop-replay-next",
+            "stop-replay-conversation",
+            "new-user",
+        )),
+    })
+    .await
+    .unwrap();
+    let mut next_seqno = 1;
+    let started = tokio::time::Instant::now();
+    while provider.requests().len() < 2 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a new user message must start a run"
+        );
+        if let Ok(frame) = next_output.try_recv() {
+            let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+            assert_eq!(
+                flags & connect::END_STREAM_FLAG,
+                0,
+                "new message ended before the provider call: {}",
+                String::from_utf8_lossy(&payload)
+            );
+            acknowledge_kv(&next, &mut next_seqno, &frame).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
 async fn runtime_cancel_action_stops_preparation_waiting_for_a_missing_blob() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
@@ -1857,6 +1975,27 @@ fn client_run() -> pb::AgentClientMessage {
 
 fn client_run_for(request_id: &str, conversation_id: &str) -> pb::AgentClientMessage {
     client_run_for_model(request_id, conversation_id, "test-model")
+}
+
+fn client_run_with_message(
+    request_id: &str,
+    conversation_id: &str,
+    message_id: &str,
+) -> pb::AgentClientMessage {
+    let mut message = client_run_for(request_id, conversation_id);
+    let Some(pb::agent_client_message::Message::RunRequest(request)) = message.message.as_mut()
+    else {
+        unreachable!("client run is a RunRequest");
+    };
+    let Some(pb::conversation_action::Action::UserMessageAction(action)) = request
+        .action
+        .as_mut()
+        .and_then(|action| action.action.as_mut())
+    else {
+        unreachable!("client run carries a user message");
+    };
+    action.user_message.as_mut().unwrap().message_id = message_id.into();
+    message
 }
 
 fn client_run_for_model(

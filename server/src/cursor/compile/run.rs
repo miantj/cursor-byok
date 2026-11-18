@@ -304,8 +304,7 @@ pub(crate) async fn prepare(
             match store.message(&conversation_id, &message_id).await? {
                 Some(message) => Some(message),
                 None if input_id.is_some() => projected_user_context.take().map(|mut message| {
-                    message.message_id = message_id.clone();
-                    message.runtime_event_id = Some(message_id);
+                    message.message_id = message_id;
                     message
                 }),
                 None => break_messages::compile_request_context(

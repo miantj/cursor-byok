@@ -33,6 +33,8 @@ pub(crate) struct ConversationDependencies {
 struct RegistryInner {
     current: Mutex<HashMap<ConversationId, ActiveRun>>,
     pending: Mutex<HashMap<ConversationId, PendingMessages>>,
+    /// User-stop mark. `None` means the cancelled turn had no user message id.
+    stopped: Mutex<HashMap<ConversationId, Option<String>>>,
     changed: Notify,
     pub dependencies: ConversationDependencies,
 }
@@ -55,6 +57,7 @@ impl ConversationRegistry {
             inner: Arc::new(RegistryInner {
                 current: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
+                stopped: Mutex::new(HashMap::new()),
                 changed: Notify::new(),
                 dependencies: ConversationDependencies {
                     store,
@@ -184,6 +187,48 @@ impl ConversationRegistry {
             }
             changed.await;
         }
+    }
+
+    pub(crate) async fn note_user_stop(&self, conversation_id: &str, message_id: Option<String>) {
+        if conversation_id.is_empty() {
+            return;
+        }
+        self.inner
+            .stopped
+            .lock()
+            .await
+            .insert(ConversationId::new(conversation_id), message_id);
+    }
+
+    /// A replay of the stopped user message, or a resume with no new user message, must not start the model.
+    pub(crate) async fn user_stop_rejects(
+        &self,
+        conversation_id: &str,
+        message_id: Option<&str>,
+    ) -> bool {
+        let Some(stopped) = self
+            .inner
+            .stopped
+            .lock()
+            .await
+            .get(&ConversationId::new(conversation_id))
+            .cloned()
+        else {
+            return false;
+        };
+        match (stopped.as_deref(), message_id) {
+            (Some(stopped), Some(incoming)) => stopped == incoming,
+            (None, Some(_)) => false,
+            (_, None) => true,
+        }
+    }
+
+    pub(crate) async fn clear_user_stop(&self, conversation_id: &str) {
+        self.inner
+            .stopped
+            .lock()
+            .await
+            .remove(&ConversationId::new(conversation_id));
     }
 
     pub(crate) async fn take_pending(
