@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import { codeInspectorPlugin } from "code-inspector-plugin";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { staticI18nPlugin } from "./plugins/static-i18n-plugin.ts";
@@ -13,15 +12,7 @@ export default defineConfig(async ({ command }) => ({
   base: "/__byok-api__/",
   plugins: [
     staticI18nPlugin(),
-    ...(command === "serve"
-      ? [codeInspectorPlugin({
-          bundler: "vite",
-          editor: "cursor",
-          hotKeys: ["ctrlKey"],
-          pathType: "absolute",
-          ...(process.platform === "darwin" ? { launchType: "open" as const } : {}),
-        })]
-      : []),
+    ...(command === "serve" ? [await codeInspector()] : []),
     ...(command === "serve" && process.env.CURSOR_OPEN_DEV_PAGE === "1" ? [openDevPagePlugin()] : []),
     react(),
   ],
@@ -48,6 +39,23 @@ export default defineConfig(async ({ command }) => ({
     },
   },
 }));
+
+async function codeInspector(): Promise<Plugin> {
+  // Node warns on the localStorage getter unless --localstorage-file is set.
+  // code-inspector's bundled debug reads it at import time and only needs the browser copy.
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    get: () => undefined,
+  });
+  const { codeInspectorPlugin } = await import("code-inspector-plugin");
+  return codeInspectorPlugin({
+    bundler: "vite",
+    editor: "cursor",
+    hotKeys: ["ctrlKey"],
+    pathType: "absolute",
+    ...(process.platform === "darwin" ? { launchType: "open" as const } : {}),
+  });
+}
 
 function openDevPagePlugin(): Plugin {
   return {
