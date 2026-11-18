@@ -50,21 +50,19 @@ pub async fn write_git_commit_message(
 ) -> Result<Response<Body>> {
     let settings = registry.store().commit_settings().await?;
     if settings.is_direct() {
-        return forward_direct(&registry, upstream, request).await;
+        return forward_direct(upstream, request).await;
     }
     generate_local(&registry, request, settings).await
 }
 
 async fn forward_direct(
-    registry: &TransportRegistry,
     upstream: CursorProxy,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let settings = registry.store().tab_settings().await?;
-    match settings.service_url() {
-        Some(service_url) => proxy::forward_to_service(&upstream, request, service_url).await,
-        None => proxy::forward(Extension(upstream), request).await,
-    }
+    // Commit "直连" always hits official Cursor. Do not reuse Tab's public
+    // service URL (tab.leokun.cn): when that origin SSL fails, Cloudflare
+    // returns HTTP 525 and Source Control shows "Failed to generate commit message".
+    proxy::forward(Extension(upstream), request).await
 }
 
 async fn generate_local(
