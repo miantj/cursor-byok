@@ -10,6 +10,7 @@ use crate::{
 };
 
 const LOCAL_NO_PROXY: &str = "localhost,127.0.0.0/8,::1";
+const CURSOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct NetworkClients {
@@ -55,6 +56,7 @@ impl NetworkClients {
         }
         let client = client_builder(&self.store)
             .await?
+            .connect_timeout(CURSOR_CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         cache.cursor = Some(client.clone());

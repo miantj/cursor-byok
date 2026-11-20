@@ -47,6 +47,17 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+pub(crate) fn error_detail(error: &dyn std::error::Error) -> String {
+    let mut detail = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    detail
+}
+
 impl Error {
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
@@ -84,7 +95,8 @@ impl IntoResponse for Error {
             | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         // 所有回给 UI 的错误统一落日志,否则失败原因只出现在前端提示里。
-        tracing::warn!(%status, error = %self, "request failed");
+        let message = error_detail(&self);
+        tracing::warn!(%status, error = %message, "request failed");
         let code = match status {
             StatusCode::BAD_REQUEST => "invalid_argument",
             StatusCode::NOT_FOUND => "not_found",
@@ -94,8 +106,44 @@ impl IntoResponse for Error {
         };
         (
             status,
-            Json(serde_json::json!({ "code": code, "message": self.to_string() })),
+            Json(serde_json::json!({ "code": code, "message": message })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_detail;
+
+    #[derive(Debug)]
+    struct Leaf;
+
+    impl std::fmt::Display for Leaf {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("reset")
+        }
+    }
+
+    impl std::error::Error for Leaf {}
+
+    #[derive(Debug)]
+    struct Wrap(Leaf);
+
+    impl std::fmt::Display for Wrap {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("sending")
+        }
+    }
+
+    impl std::error::Error for Wrap {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn error_detail_keeps_the_source_chain() {
+        assert_eq!(error_detail(&Wrap(Leaf)), "sending: reset");
     }
 }

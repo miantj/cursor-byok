@@ -1,5 +1,5 @@
 //! Selects local handling or the configured official Cursor upstream.
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -10,6 +10,7 @@ use axum::{
 use crate::Result;
 
 const CURSOR_UPSTREAM: &str = "https://api2.cursor.sh";
+const CURSOR_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(20);
 pub const UPSTREAM_URL_HEADER: &str = "x-server-upstream-url";
 
 #[derive(Clone)]
@@ -101,12 +102,14 @@ async fn forward_request(
     remove_hop_by_hop_headers(&mut headers);
 
     let client = proxy.client().await?;
-    let upstream = client
-        .request(parts.method.clone(), url)
-        .headers(headers)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
-        .send()
-        .await;
+    let upstream = send_upstream(
+        client
+            .request(parts.method.clone(), url)
+            .headers(headers)
+            .body(reqwest::Body::wrap_stream(body.into_data_stream())),
+        CURSOR_RESPONSE_HEADERS_TIMEOUT,
+    )
+    .await;
 
     let upstream = match upstream {
         Ok(response) => response,
@@ -115,10 +118,10 @@ async fn forward_request(
                 method = %parts.method,
                 path,
                 elapsed_ms = started.elapsed().as_millis(),
-                %error,
+                error = %crate::error::error_detail(&error),
                 "Cursor upstream request failed"
             );
-            return Err(error.into());
+            return Err(error);
         }
     };
 
@@ -164,14 +167,16 @@ pub async fn forward_buffered(
     let body = to_bytes(body, usize::MAX)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
-    let upstream = proxy
-        .client()
-        .await?
-        .request(parts.method, url)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await?;
+    let upstream = send_upstream(
+        proxy
+            .client()
+            .await?
+            .request(parts.method, url)
+            .headers(headers)
+            .body(body),
+        CURSOR_RESPONSE_HEADERS_TIMEOUT,
+    )
+    .await?;
     let status = upstream.status();
     let mut headers = upstream.headers().clone();
     remove_hop_by_hop_headers(&mut headers);
@@ -181,6 +186,20 @@ pub async fn forward_buffered(
         headers,
         body,
     })
+}
+
+async fn send_upstream(
+    request: reqwest::RequestBuilder,
+    header_timeout: Duration,
+) -> Result<reqwest::Response> {
+    match tokio::time::timeout(header_timeout, request.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(crate::Error::Provider(format!(
+            "Cursor upstream timed out after {} seconds waiting for response headers",
+            header_timeout.as_secs()
+        ))),
+    }
 }
 
 fn upstream_url(headers: &axum::http::HeaderMap, fallback: &str, path: &str) -> Result<String> {
@@ -229,4 +248,30 @@ fn remove_hop_by_hop_headers(headers: &mut axum::http::HeaderMap) {
         headers.remove(name);
     }
     headers.remove("keep-alive");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::send_upstream;
+
+    #[tokio::test]
+    async fn header_wait_stops_when_the_upstream_never_replies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let started = Instant::now();
+        let error = send_upstream(
+            reqwest::Client::new().get(format!("http://{address}/")),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("waiting for response headers"));
+    }
 }

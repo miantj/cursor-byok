@@ -55,10 +55,7 @@ pub async fn write_git_commit_message(
     generate_local(&registry, request, settings).await
 }
 
-async fn forward_direct(
-    upstream: CursorProxy,
-    request: Request<Body>,
-) -> Result<Response<Body>> {
+async fn forward_direct(upstream: CursorProxy, request: Request<Body>) -> Result<Response<Body>> {
     // Commit "直连" always hits official Cursor. Do not reuse Tab's public
     // service URL (tab.leokun.cn): when that origin SSL fails, Cloudflare
     // returns HTTP 525 and Source Control shows "Failed to generate commit message".

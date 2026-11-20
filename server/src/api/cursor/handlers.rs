@@ -23,7 +23,7 @@ use crate::{
             account, analytics, commit_message, compatibility, entitlement::FreeEntitlementCache,
             knowledge, model_catalog, server_config, tab,
         },
-        transport::{BugbotReplay, TransportParent, TransportRegistry},
+        transport::{BugbotReplay, TransportParent, TransportRegistry, TransportRoute},
     },
     Result,
 };
@@ -35,6 +35,8 @@ mod bugbot_tests;
 #[cfg(test)]
 #[path = "model_selection_tests.rs"]
 mod model_selection_tests;
+
+const MISSING_MODEL_ROUTE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub fn router(
     registry: TransportRegistry,
@@ -278,23 +280,25 @@ async fn bidi_handler(
             );
             false
         }
-    } else if registry.local(&decoded.request_id).await.is_some() {
-        true
-    } else if registry.upstream(&decoded.request_id).await {
-        false
-    } else if registry.local(&decoded.request_id).await.is_some() {
-        // The official stream may have handed off while the route was being read.
-        true
     } else {
-        trace.resume();
-        trace.request(
-            "bidi_request",
-            body.clone(),
-            trace_outcome(trace_metadata, false, "missing_transport", None),
-        );
-        return Err(crate::Error::Protocol(
-            "first BidiAppend message must select a model".into(),
-        ));
+        match registry
+            .wait_route_for(&decoded.request_id, MISSING_MODEL_ROUTE_WAIT)
+            .await
+        {
+            Some(TransportRoute::Local) => true,
+            Some(TransportRoute::Upstream(_)) => false,
+            None => {
+                trace.resume();
+                trace.request(
+                    "bidi_request",
+                    body.clone(),
+                    trace_outcome(trace_metadata, false, "missing_transport", None),
+                );
+                return Err(crate::Error::Protocol(
+                    "first BidiAppend message must select a model".into(),
+                ));
+            }
+        }
     };
     if first_model.is_some() {
         trace.begin(

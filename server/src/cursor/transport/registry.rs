@@ -265,6 +265,16 @@ impl TransportRegistry {
             })
     }
 
+    pub async fn wait_route_for(
+        &self,
+        request_id: &str,
+        timeout: std::time::Duration,
+    ) -> Option<TransportRoute> {
+        tokio::time::timeout(timeout, self.wait_route(request_id))
+            .await
+            .ok()
+    }
+
     pub async fn wait_route(&self, request_id: &str) -> TransportRoute {
         loop {
             let changed = self.inner.route_changed.notified();
@@ -326,5 +336,83 @@ impl TransportRegistry {
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{
+        cursor::prompting::{PromptAssets, PromptCompiler},
+        model::ModelInvocation,
+        provider::{Provider, ProviderStream},
+        store::Store,
+    };
+
+    use super::{TransportRegistry, TransportRoute};
+
+    struct UnusedProvider;
+
+    impl Provider for UnusedProvider {
+        fn stream(&self, _: ModelInvocation, _: CancellationToken) -> ProviderStream {
+            panic!("route wait must not start a provider")
+        }
+    }
+
+    async fn registry() -> (tempfile::TempDir, TransportRegistry) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        (
+            directory,
+            TransportRegistry::new(
+                store,
+                Arc::new(UnusedProvider),
+                PromptCompiler::new(PromptAssets::embedded().unwrap()),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn route_wait_returns_an_existing_route() {
+        let (_directory, registry) = registry().await;
+        registry.mark_upstream("ready", None).await;
+        assert_eq!(
+            registry
+                .wait_route_for("ready", Duration::from_millis(50))
+                .await,
+            Some(TransportRoute::Upstream(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn route_wait_observes_a_route_registered_while_waiting() {
+        let (_directory, registry) = registry().await;
+        let pending = registry.wait_route_for("late", Duration::from_secs(2));
+        tokio::pin!(pending);
+        tokio::select! {
+            _ = &mut pending => panic!("route appeared before it was registered"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        registry.mark_upstream("late", None).await;
+        assert_eq!(pending.await, Some(TransportRoute::Upstream(1)));
+    }
+
+    #[tokio::test]
+    async fn route_wait_returns_none_when_nothing_registers() {
+        let (_directory, registry) = registry().await;
+        assert_eq!(
+            registry
+                .wait_route_for("missing", Duration::from_millis(50))
+                .await,
+            None
+        );
     }
 }

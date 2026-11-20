@@ -35,7 +35,7 @@ impl From<crate::Error> for RunFailure {
             }
             Error::Store(message) => Self::Store(message),
             Error::Cancelled => Self::Client("run was cancelled".into()),
-            Error::Http(error) => Self::Provider(error.to_string()),
+            Error::Http(error) => Self::Provider(crate::error::error_detail(&error)),
             Error::Database(error) => Self::Store(error.to_string()),
             Error::Migration(error) => Self::Store(error.to_string()),
             Error::MigrationTimeout {
