@@ -16,7 +16,11 @@ use crate::{
     Error, Result,
 };
 
-use super::ca::LoadedCa;
+use super::{
+    ca::LoadedCa,
+    proxy_release::{self, ProxyRelease},
+    settings,
+};
 
 #[derive(Default)]
 pub struct ProxyRuntime {
@@ -24,6 +28,7 @@ pub struct ProxyRuntime {
     port: Option<u16>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
+    release: Option<ProxyRelease>,
 }
 
 impl ProxyRuntime {
@@ -51,8 +56,10 @@ impl ProxyRuntime {
         if let Some(url) = self.url() {
             return Ok((url, self.port.unwrap_or_default()));
         }
+        self.stop().await?;
         let listener = bind_proxy_listener(requested_port).await?;
         let address = listener.local_addr()?;
+        let url = format!("http://{address}");
         let (stop, done) = oneshot::channel();
         let authority = RcgenAuthority::new(ca.issuer, 1_000, aws_lc_rs::default_provider());
         let proxy = Proxy::builder()
@@ -65,26 +72,36 @@ impl ProxyRuntime {
             })
             .build()
             .map_err(|error| Error::Store(format!("build Cursor proxy: {error}")))?;
+        self.release = proxy_release::arm(&url)?;
         self.stop = Some(stop);
-        self.url = Some(format!("http://{address}"));
+        self.url = Some(url.clone());
         self.port = Some(address.port());
         self.task = Some(tokio::spawn(async move {
             if let Err(error) = proxy.start().await {
                 tracing::error!(%error, "Cursor proxy stopped unexpectedly");
             }
         }));
-        Ok((self.url.clone().unwrap(), address.port()))
+        Ok((url, address.port()))
     }
 
-    pub async fn stop(&mut self) {
+    pub async fn stop(&mut self) -> Result<()> {
+        let cleanup = self
+            .url
+            .take()
+            .map_or(Ok(()), |url| settings::clear_proxy_settings(&url));
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(task) = self.task.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
         }
-        self.url = None;
         self.port = None;
+        if let Some(release) = self.release.take() {
+            if cleanup.is_ok() {
+                release.disarm().await;
+            }
+        }
+        cleanup
     }
 }
 

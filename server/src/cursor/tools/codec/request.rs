@@ -84,6 +84,7 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                 .and_then(Value::as_u64)
                 .map(|v| v as u32),
             encoding_hint: optional_string("encoding_hint"),
+            ..Default::default()
         }),
         "delete" => Message::DeleteArgs(pb::DeleteArgs {
             path: string_aliased(&["path", "file_path", "filePath"])?,
@@ -158,7 +159,7 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                 }
             },
             cloud_base_branch: optional_string("cloud_base_branch"),
-            credentials: None,
+            ..Default::default()
         }),
         "fetchmcpresource" => Message::ReadMcpResourceExecArgs(pb::ReadMcpResourceExecArgs {
             server: string("server")?,
@@ -219,6 +220,7 @@ pub(super) fn edit_write_request(
             return_file_content_after_write: false,
             file_bytes: Vec::new(),
             encoding_hint: None,
+            ..Default::default()
         }),
         Some(true),
     ))
@@ -239,6 +241,7 @@ fn server_message(
                 span_context: None,
                 accept_hook_additional_contexts,
                 message: Some(message),
+                ..Default::default()
             },
         )),
     }
@@ -260,8 +263,6 @@ pub fn mcp_request(
             pb::ExecServerMessage {
                 id,
                 exec_id: call.call_id.clone(),
-                span_context: None,
-                accept_hook_additional_contexts: None,
                 message: Some(pb::exec_server_message::Message::McpArgs(pb::McpArgs {
                     name: definition.name.clone(),
                     args,
@@ -272,7 +273,9 @@ pub fn mcp_request(
                     smart_mode_approval_only: false,
                     skip_approval: false,
                     server_identifier: String::new(),
+                    ..Default::default()
                 })),
+                ..Default::default()
             },
         )),
     })
@@ -323,6 +326,7 @@ pub(crate) fn mcp_meta_request(
             smart_mode_approval_only: false,
             skip_approval: false,
             server_identifier: server_identifier.into(),
+            ..Default::default()
         }),
         Some(true),
     ))
@@ -341,6 +345,7 @@ pub fn mcp_state_request(id: u32, call: &ToolCall) -> pb::AgentServerMessage {
         pb::exec_server_message::Message::McpStateExecArgs(pb::McpStateExecArgs {
             server_identifiers,
             kick_only: false,
+            ..Default::default()
         }),
         Some(false),
     )

@@ -32,16 +32,8 @@ impl CheckpointBuilder {
             .ok_or_else(|| Error::Protocol("compaction produced no summary root".into()))?
             .clone();
 
-        let summary_id = self
-            .sync
-            .persist(
-                &pb::ConversationSummary {
-                    summary: summary.into(),
-                }
-                .encode_to_vec(),
-                &[],
-            )
-            .await?;
+        // agent_v1 dropped ConversationSummary; blob payload is raw UTF-8.
+        let summary_id = self.sync.persist(summary.as_bytes(), &[]).await?;
         let archive = pb::ConversationSummaryArchive {
             summarized_messages: summarized.iter().map(|id| id.as_bytes().to_vec()).collect(),
             summary: summary.into(),

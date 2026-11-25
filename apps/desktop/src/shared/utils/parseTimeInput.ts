@@ -71,7 +71,17 @@ export function parseTimeInput(input: string, now = new Date()): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+const twoDigits = (value: number) => String(value).padStart(2, "0");
+
+export function formatDateInput(date: Date) {
+  return `${String(date.getFullYear()).padStart(4, "0")}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())}`;
+}
+
+export function parseDateInput(value: string) {
+  const date = new Date(`${value}T00:00:00`);
+  return formatDateInput(date) === value ? date : null;
+}
+
 export function formatTimeInput(date: Date) {
-  const part = (number: number) => String(number).padStart(2, "0");
-  return `${date.getFullYear()}-${part(date.getMonth() + 1)}-${part(date.getDate())} ${part(date.getHours())}:${part(date.getMinutes())}`;
+  return `${formatDateInput(date)} ${twoDigits(date.getHours())}:${twoDigits(date.getMinutes())}`;
 }

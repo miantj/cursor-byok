@@ -538,9 +538,100 @@ mod tests {
             .unwrap();
         assert_eq!(overview.metrics.llm_calls, 1);
         assert_eq!(overview.metrics.successful_calls, 1);
+        assert_eq!(overview.model_token_usage.len(), 1);
+        assert_eq!(overview.model_token_usage[0].model_name, "GPT Test");
+        assert_eq!(
+            overview.model_token_usage[0].token_usage,
+            overview.metrics.token_usage
+        );
         let call = store.llm_call("plugin-call").await.unwrap().unwrap();
         assert!(call.run_kind.is_none());
         assert_eq!(store.llm_calls(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn overview_groups_calls_after_model_hash_is_cleared() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        for (call_id, model_id, display_name, input_tokens) in [
+            ("alpha-call", "alpha", "Alpha", 100_u64),
+            ("beta-call", "beta", "Beta", 40_u64),
+        ] {
+            store
+                .start_llm_call(&NewLlmCall {
+                    call_id: call_id.into(),
+                    run_id: format!("run-{call_id}"),
+                    conversation_id: "conversation".into(),
+                    provider_call_index: 0,
+                    model_hash: format!("hash-{model_id}"),
+                    provider_type: ProviderType::Plugin,
+                    provider_url: "plugin://test".into(),
+                    request_type: ProviderType::Plugin,
+                    request_url: "plugin://test".into(),
+                    model_id: model_id.into(),
+                    display_name: display_name.into(),
+                    reasoning_effort: None,
+                    fast: false,
+                    message_count: 1,
+                    tool_count: 0,
+                    detailed: false,
+                })
+                .await
+                .unwrap();
+            store
+                .record_llm_usage(
+                    call_id,
+                    Usage {
+                        input_tokens: Some(input_tokens),
+                        output_tokens: Some(10),
+                        total_tokens: Some(input_tokens + 10),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let filtered = store
+            .overview(None, None, Some(r#"["hash-beta"]"#), None)
+            .await
+            .unwrap();
+        assert_eq!(filtered.metrics.llm_calls, 0);
+        assert_eq!(filtered.metrics.token_usage, 50);
+        assert_eq!(filtered.model_token_usage.len(), 1);
+        assert_eq!(filtered.model_token_usage[0].model_hash, "hash-beta");
+
+        sqlx::query("UPDATE llm_calls SET model_hash = NULL")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let overview = store.overview(None, None, None, None).await.unwrap();
+        let mut usage = overview
+            .model_token_usage
+            .iter()
+            .map(|model| {
+                (
+                    model.model_hash.as_str(),
+                    model.model_name.as_str(),
+                    model.token_usage,
+                )
+            })
+            .collect::<Vec<_>>();
+        usage.sort_by_key(|row| row.0);
+        assert_eq!(usage, [("alpha", "Alpha", 110), ("beta", "Beta", 50)]);
+        assert_eq!(
+            overview
+                .model_token_usage
+                .iter()
+                .map(|model| model.token_usage)
+                .sum::<i64>(),
+            overview.metrics.token_usage
+        );
     }
 
     #[tokio::test]

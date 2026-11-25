@@ -101,7 +101,6 @@ impl CheckpointBuilder {
         }
         details.max_tokens = max_tokens.min(u32::MAX as u64) as u32;
         details.prompt_context_usage_tree = None;
-        details.prompt_context_usage_snapshot_blob_id = None;
     }
 
     pub async fn settled(
@@ -241,10 +240,8 @@ impl CheckpointBuilder {
                     subagent_type: args.subagent_type.clone(),
                     model_id: args.model.clone(),
                     environment: args.environment,
-                    cloud_subagent: None,
-                    first_class_bc_id: None,
-                    cloud_requested_environment_build_id: None,
                     machine: args.machine.clone(),
+                    ..Default::default()
                 });
             self.base.subagent_runs_by_parent_tool_call_id.insert(
                 tool_call_id.clone(),

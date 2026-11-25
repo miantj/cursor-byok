@@ -6,10 +6,13 @@ import type {
   Model,
   Overview,
   OverviewTokenUsageBucket,
+  PluginRuntimeStatus,
   ProxySettings,
   StatisticsStorage,
   TabSettings,
+  TokenPricingSettings,
 } from "../shared/api";
+import { DEFAULT_TOKEN_PRICING } from "../shared/store/appStore";
 
 const API_ROOT = "/__byok-api__/api";
 const FIXED_NOW = Date.UTC(2026, 7, 27, 8, 0, 0);
@@ -91,6 +94,7 @@ let harnessStatus: CursorHarnessStatus = {
 
 let detailed = true;
 let portSettings = { proxy_port: 0, service_port: 0 };
+let pricing = DEFAULT_TOKEN_PRICING;
 let externalApiSettings: ExternalApiSettings = { enabled: false, api_key: "" };
 let proxySettings: ProxySettings = {
   mode: "default",
@@ -129,6 +133,16 @@ export function installDemoApi() {
       return method === "DELETE" ? empty() : json(models[0]);
     }
     if (path === "/overview") return json(createOverview(url.searchParams));
+    if (path === "/plugins") return json([]);
+    if (path === "/plugins/runtime") return json({
+      state: "ready",
+      version: "demo",
+      target: null,
+      phase: null,
+      downloaded_bytes: 0,
+      total_bytes: null,
+      error: null,
+    } satisfies PluginRuntimeStatus);
     if (path === "/llm-calls") return json(calls);
     if (path.startsWith("/llm-calls/")) return json(createCallDetail(path.slice("/llm-calls/".length)));
     if (path === "/harness/cursor/status") return json(harnessStatus);
@@ -152,6 +166,10 @@ export function installDemoApi() {
     if (path === "/settings/ports") {
       portSettings = body as typeof portSettings;
       return json(portSettings);
+    }
+    if (path === "/settings/pricing") {
+      if (method === "PUT") pricing = body as TokenPricingSettings;
+      return json(pricing);
     }
     if (path === "/settings/external-api" && method === "GET") return json(externalApiSettings);
     if (path === "/settings/external-api") {
@@ -236,27 +254,51 @@ function createOverview(params: URLSearchParams): Overview {
   const granularity = duration <= 2 * 60 * 60_000 ? "minute" : duration <= 2 * 86_400_000 ? "hour" : "day";
   const step = granularity === "minute" ? 60_000 : granularity === "hour" ? 3_600_000 : 86_400_000;
   const count = granularity === "minute" ? Math.min(60, Math.max(10, Math.ceil(duration / step))) : granularity === "hour" ? Math.min(24, Math.max(8, Math.ceil(duration / step))) : Math.min(365, Math.max(7, Math.ceil(duration / step)));
-  const series = createSeries(count, step, Number.isFinite(end) && end > 0 ? end : FIXED_NOW);
+  const selectedHashes: string[] = JSON.parse(params.get("model_hashes") ?? "[]");
+  const weightedModels = models.map((model, index) => ({ model, weight: [720, 38, 24][index] ?? 1 }));
+  const included = weightedModels.filter(({ model }) => !selectedHashes.length || selectedHashes.includes(model.model_hash));
+  const totalWeight = weightedModels.reduce((sum, { weight }) => sum + weight, 0);
+  const includedWeight = included.reduce((sum, { weight }) => sum + weight, 0);
+  const share = includedWeight / totalWeight;
+  const series = createSeries(count, step, Number.isFinite(end) && end > 0 ? end : FIXED_NOW).map((bucket) => ({
+    bucket_start_ms: bucket.bucket_start_ms,
+    input_tokens: Math.round(bucket.input_tokens * share),
+    cache_read_tokens: Math.round(bucket.cache_read_tokens * share),
+    cache_write_tokens: Math.round(bucket.cache_write_tokens * share),
+    output_tokens: Math.round(bucket.output_tokens * share),
+  }));
   const totals = series.reduce((sum, bucket) => ({
     input: sum.input + bucket.input_tokens,
     cacheRead: sum.cacheRead + bucket.cache_read_tokens,
     cacheWrite: sum.cacheWrite + bucket.cache_write_tokens,
     output: sum.output + bucket.output_tokens,
   }), { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
-  const llmCalls = Math.max(12, Math.round(count * 5.4));
+  const llmCalls = Math.round(Math.max(12, count * 5.4) * share);
+  const failedCalls = llmCalls > 0 ? Math.max(1, Math.floor(llmCalls * 0.008)) : 0;
+  const promptTokens = totals.input + totals.cacheRead + totals.cacheWrite;
+  const tokenUsage = promptTokens + totals.output;
+  const modelTokenUsage = included.map(({ model, weight }) => ({
+    model_hash: model.model_hash,
+    model_name: model.display_name,
+    token_usage: Math.floor(tokenUsage * weight / includedWeight),
+  }));
+  if (modelTokenUsage.length) {
+    modelTokenUsage[0].token_usage += tokenUsage - modelTokenUsage.reduce((sum, row) => sum + row.token_usage, 0);
+  }
 
   return {
     metrics: {
       llm_calls: llmCalls,
-      successful_calls: llmCalls - Math.max(1, Math.floor(llmCalls * 0.008)),
-      failed_calls: Math.max(1, Math.floor(llmCalls * 0.008)),
-      token_usage: totals.input + totals.cacheRead + totals.cacheWrite + totals.output,
-      prompt_tokens: totals.input + totals.cacheRead + totals.cacheWrite,
+      successful_calls: llmCalls - failedCalls,
+      failed_calls: failedCalls,
+      token_usage: tokenUsage,
+      prompt_tokens: promptTokens,
       input_tokens: totals.input,
       cache_read_tokens: totals.cacheRead,
       cache_write_tokens: totals.cacheWrite,
       output_tokens: totals.output,
     },
+    model_token_usage: modelTokenUsage,
     token_usage_granularity: granularity,
     token_usage_series: series,
   };

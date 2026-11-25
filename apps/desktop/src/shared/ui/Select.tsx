@@ -70,6 +70,15 @@ type ComboboxProps = {
   onChange: (value: string) => void;
 };
 
+function normalizeModelId(text: string) {
+  return text.trim().toLowerCase().replace(/[\s_-]+/g, "");
+}
+
+function filterModelIds(options: string[], value: string) {
+  const query = normalizeModelId(value);
+  return options.filter((option) => normalizeModelId(option).includes(query));
+}
+
 export const Combobox = forwardRef<ComboboxHandle, ComboboxProps>(function Combobox({ value, options = [], placeholder, disabled, append, onChange }, ref) {
   const root = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLInputElement>(null);
@@ -81,11 +90,7 @@ export const Combobox = forwardRef<ComboboxHandle, ComboboxProps>(function Combo
   const [filtering, setFiltering] = useState(true);
   const [active, setActive] = useState(-1);
   const [position, setPosition] = useState({ left: 0, top: 0, width: 0, maxHeight: 280 });
-  const filtered = useMemo(() => {
-    if (!filtering) return options;
-    const query = value.trim().toLocaleLowerCase();
-    return options.filter((option) => !query || option.toLocaleLowerCase().includes(query));
-  }, [filtering, options, value]);
+  const filtered = useMemo(() => filtering ? filterModelIds(options, value) : options, [filtering, options, value]);
 
   useImperativeHandle(ref, () => ({
     openAll: () => {
@@ -121,9 +126,10 @@ export const Combobox = forwardRef<ComboboxHandle, ComboboxProps>(function Combo
     if (disabled || options.length === 0) return;
     setFiltering(true);
     setOpen(true);
-    const query = value.trim().toLocaleLowerCase();
-    const matchingOptions = options.filter((option) => !query || option.toLocaleLowerCase().includes(query));
-    const selected = matchingOptions.indexOf(value);
+    const matching = filtering ? filtered : filterModelIds(options, value);
+    const exact = matching.indexOf(value);
+    const query = normalizeModelId(value);
+    const selected = exact >= 0 ? exact : matching.findIndex((option) => normalizeModelId(option) === query);
     setActive(selected >= 0 ? selected : 0);
   };
   const choose = (option: string) => { onChange(option); setOpen(false); input.current?.focus(); };

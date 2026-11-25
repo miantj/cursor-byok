@@ -18,6 +18,7 @@
   "092b520558eff5f2": "Não testado",
   "099008ea7a42ebd1": "Todos os valores de cabeçalhos personalizados devem ser strings",
   "09ebc2643631ba25": "Valor estimado",
+  "0a9156766e0a2c67": "Modelo desconhecido",
   "0b96da34f6fbdd3b": "Leitura de cache: {tokens} × ${price}/1M = {cost}",
   "0bbb2c0ce279d6d5": "Nenhum modelo sincronizado ainda",
   "0c70665b6eb65f1a": "Não",

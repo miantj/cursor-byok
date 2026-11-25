@@ -93,9 +93,7 @@ impl CheckpointBuilder {
                     user_message: user_id.as_bytes().to_vec(),
                     steps: Vec::new(),
                     request_id: Some(self.sync.request_id().into()),
-                    encrypted_model: None,
-                    dynamic_tool_count: None,
-                    send_message_step_indices: Vec::new(),
+                    ..Default::default()
                 },
             });
             return Ok(());

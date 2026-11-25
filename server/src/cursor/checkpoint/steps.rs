@@ -30,6 +30,7 @@ impl StepBuffer {
             message: Some(pb::conversation_step::Message::AssistantMessage(
                 pb::AssistantMessage {
                     text: std::mem::take(&mut self.text),
+                    ..Default::default()
                 },
             )),
         });
@@ -48,6 +49,7 @@ impl StepBuffer {
                 pb::ThinkingMessage {
                     text: std::mem::take(&mut self.thinking),
                     duration_ms: duration.as_millis().min(u32::MAX as u128) as u32,
+                    ..Default::default()
                 },
             )),
         });

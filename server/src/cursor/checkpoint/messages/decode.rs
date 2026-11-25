@@ -146,16 +146,7 @@ fn decode_text(value: &Value) -> Result<MessageContent> {
             Some("text") => Ok(ContentPart::Text {
                 text: required_string(part, "text")?.into(),
             }),
-            Some("image") => {
-                let mime_type = required_string(part, "mimeType")?;
-                let encoded = required_string(part, "image")?;
-                Ok(ContentPart::Image {
-                    mime_type: mime_type.into(),
-                    data: STANDARD.decode(encoded).map_err(|error| {
-                        Error::Protocol(format!("invalid Cursor image base64: {error}"))
-                    })?,
-                })
-            }
+            Some("image") => decode_image(part),
             Some(kind) => Err(Error::Protocol(format!(
                 "unsupported Cursor message content part: {kind}"
             ))),
@@ -248,6 +239,30 @@ fn decode_tool_result(value: &Value) -> Result<ToolResultContent> {
             .unwrap_or(false),
         image: None,
         provider_parts: Vec::new(),
+    })
+}
+
+fn decode_image(part: &Value) -> Result<ContentPart> {
+    let mime_type = required_string(part, "mimeType")?;
+    let data = match part.get("image") {
+        Some(Value::String(encoded)) => STANDARD
+            .decode(encoded)
+            .map_err(|error| Error::Protocol(format!("invalid Cursor image base64: {error}")))?,
+        Some(Value::Object(image))
+            if image.get("__type").and_then(Value::as_str) == Some("Uint8Array") =>
+        {
+            let hex = image
+                .get("hex")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Protocol("Cursor image Uint8Array is missing hex".into()))?;
+            hex::decode(hex)
+                .map_err(|error| Error::Protocol(format!("invalid Cursor image hex: {error}")))?
+        }
+        _ => return Err(Error::Protocol("invalid or missing Cursor image".into())),
+    };
+    Ok(ContentPart::Image {
+        mime_type: mime_type.into(),
+        data,
     })
 }
 

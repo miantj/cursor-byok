@@ -6,13 +6,17 @@ use serde_json::Value;
 use crate::{Error, Result};
 
 const NO_PROXY_KEY: &str = "http.noProxy";
-const KEYS: [&str; 5] = [
-    "http.proxy",
-    "http.proxyKerberosServicePrincipal",
-    "http.proxySupport",
-    "cursor.general.disableHttp2",
-    "http.experimental.systemCertificatesV2",
-];
+const PROXY_KEY: &str = "http.proxy";
+
+fn managed_values(url: &str) -> [(&'static str, Value); 5] {
+    [
+        (PROXY_KEY, Value::from(url)),
+        ("http.proxyKerberosServicePrincipal", Value::from(url)),
+        ("http.proxySupport", Value::from("on")),
+        ("cursor.general.disableHttp2", Value::Bool(true)),
+        ("http.experimental.systemCertificatesV2", Value::Bool(true)),
+    ]
+}
 
 fn path() -> Result<PathBuf> {
     let home = dirs::home_dir()
@@ -62,50 +66,76 @@ fn write(settings: &BTreeMap<String, Value>) -> Result<()> {
 pub fn write_proxy_settings(proxy_url: &str) -> Result<()> {
     let mut settings = read()?;
     settings.remove(NO_PROXY_KEY);
-    settings.insert(KEYS[0].into(), Value::String(proxy_url.into()));
-    settings.insert(KEYS[1].into(), Value::String(proxy_url.into()));
-    settings.insert(KEYS[2].into(), Value::String("on".into()));
-    settings.insert(KEYS[3].into(), Value::Bool(true));
-    settings.insert(KEYS[4].into(), Value::Bool(true));
+    settings.extend(managed_values(proxy_url).map(|(key, value)| (key.into(), value)));
     write(&settings)
 }
 
-pub fn clear_proxy_settings() -> Result<()> {
+pub fn clear_proxy_settings(url: &str) -> Result<()> {
     let mut settings = read()?;
-    let before = settings.len();
-    for key in KEYS {
-        settings.remove(key);
-    }
-    if settings.len() != before {
+    if strip_managed_values(&mut settings, url) {
         write(&settings)?;
     }
     Ok(())
 }
 
+fn strip_managed_values(settings: &mut BTreeMap<String, Value>, url: &str) -> bool {
+    if settings.get(PROXY_KEY).and_then(Value::as_str) != Some(url) {
+        return false;
+    }
+    for (key, value) in managed_values(url) {
+        if settings.get(key) == Some(&value) {
+            settings.remove(key);
+        }
+    }
+    true
+}
+
 pub fn settings_match(proxy_url: &str) -> Result<bool> {
-    let settings = read()?;
-    Ok(
-        settings.get(KEYS[0]) == Some(&Value::String(proxy_url.into()))
-            && settings.get(KEYS[1]) == Some(&Value::String(proxy_url.into()))
-            && settings.get(KEYS[2]) == Some(&Value::String("on".into()))
-            && settings.get(KEYS[3]) == Some(&Value::Bool(true))
-            && settings.get(KEYS[4]) == Some(&Value::Bool(true)),
-    )
+    Ok(has_managed_values(&read()?, proxy_url))
+}
+
+fn has_managed_values(settings: &BTreeMap<String, Value>, url: &str) -> bool {
+    managed_values(url)
+        .iter()
+        .all(|(key, value)| settings.get(*key) == Some(value))
 }
 
 pub fn clear_stale_managed_settings() -> Result<()> {
-    let settings = read()?;
-    let managed_signature = settings.get(KEYS[2]) == Some(&Value::String("on".into()))
-        && settings.get(KEYS[3]) == Some(&Value::Bool(true))
-        && settings.get(KEYS[4]) == Some(&Value::Bool(true));
-    let loopback = settings
-        .get(KEYS[0])
+    let mut settings = read()?;
+    let Some(url) = settings
+        .get(PROXY_KEY)
         .and_then(Value::as_str)
-        .and_then(|value| value.parse::<reqwest::Url>().ok())
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
-    if managed_signature && loopback {
-        clear_proxy_settings()?;
+        .map(str::to_owned)
+    else {
+        return Ok(());
+    };
+    let loopback = url
+        .parse::<reqwest::Url>()
+        .is_ok_and(|url| matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")));
+    if loopback && has_managed_values(&settings, &url) {
+        strip_managed_values(&mut settings, &url);
+        write(&settings)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_only_removes_values_still_owned_by_the_proxy() {
+        let url = "http://127.0.0.1:9";
+        let mut settings =
+            BTreeMap::from(managed_values(url).map(|(key, value)| (key.into(), value)));
+        settings.insert("editor.fontSize".into(), Value::from(14));
+        settings.insert("cursor.general.disableHttp2".into(), Value::Bool(false));
+        assert!(!strip_managed_values(&mut settings, "http://127.0.0.1:10"));
+        assert_eq!(settings.get(PROXY_KEY), Some(&Value::from(url)));
+        assert!(strip_managed_values(&mut settings, url));
+        assert_eq!(settings.len(), 2);
+        assert_eq!(settings["editor.fontSize"], 14);
+        assert_eq!(settings["cursor.general.disableHttp2"], false);
+        assert!(!strip_managed_values(&mut settings, url));
+    }
 }

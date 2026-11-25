@@ -313,6 +313,7 @@ async fn client_heartbeat_returns_a_server_protocol_heartbeat() {
         Some(pb::agent_server_message::Message::InteractionUpdate(
             pb::InteractionUpdate {
                 message: Some(pb::interaction_update::Message::Heartbeat(_)),
+                ..
             }
         ))
     ));
@@ -2222,6 +2223,7 @@ async fn wait_for_turn_ended(
             Some(pb::agent_server_message::Message::InteractionUpdate(
                 pb::InteractionUpdate {
                     message: Some(pb::interaction_update::Message::TurnEnded(_)),
+                    ..
                 }
             ))
         );

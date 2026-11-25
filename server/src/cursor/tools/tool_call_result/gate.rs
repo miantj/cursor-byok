@@ -783,6 +783,7 @@ mod tests {
                         .collect(),
                     is_error: false,
                     structured_content: None,
+                    ..Default::default()
                 })),
             }),
             description: None,

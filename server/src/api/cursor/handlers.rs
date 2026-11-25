@@ -287,6 +287,15 @@ async fn bidi_handler(
         {
             Some(TransportRoute::Local) => true,
             Some(TransportRoute::Upstream(_)) => false,
+            None if registry.recently_closed(&decoded.request_id) => {
+                trace.resume();
+                trace.request(
+                    "bidi_request",
+                    body,
+                    trace_outcome(trace_metadata, true, "closed", None),
+                );
+                return Ok(bidi::append_response());
+            }
             None => {
                 trace.resume();
                 trace.request(

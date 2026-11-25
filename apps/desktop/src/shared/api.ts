@@ -368,8 +368,15 @@ export interface OverviewTokenUsageBucket {
   output_tokens: number;
 }
 
+export interface ModelTokenUsage {
+  model_hash: string;
+  model_name: string;
+  token_usage: number;
+}
+
 export interface Overview {
   metrics: OverviewMetrics;
+  model_token_usage: ModelTokenUsage[];
   token_usage_granularity: TokenUsageGranularity;
   token_usage_series: OverviewTokenUsageBucket[];
 }

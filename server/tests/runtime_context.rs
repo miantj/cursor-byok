@@ -521,7 +521,8 @@ async fn finish_turn(
             message.message,
             Some(pb::agent_server_message::Message::InteractionUpdate(
                 pb::InteractionUpdate {
-                    message: Some(pb::interaction_update::Message::TurnEnded(_))
+                    message: Some(pb::interaction_update::Message::TurnEnded(_)),
+                    ..
                 }
             ))
         ) {

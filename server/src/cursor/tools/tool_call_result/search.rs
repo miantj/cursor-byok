@@ -64,6 +64,7 @@ pub(crate) fn complete(
                     }],
                     is_error: false,
                     structured_content,
+                    ..Default::default()
                 }),
             )
         }
@@ -73,6 +74,7 @@ pub(crate) fn complete(
             McpResult::Error(pb::McpToolError {
                 error,
                 read_tool_def_reminder: String::new(),
+                ..Default::default()
             }),
         ),
     };

@@ -45,6 +45,7 @@ let snapshot: AppSnapshot = {
       cache_write_tokens: 0,
       output_tokens: 0,
     },
+    model_token_usage: [],
     token_usage_granularity: "day",
     token_usage_series: [],
   },

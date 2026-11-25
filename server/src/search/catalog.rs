@@ -90,24 +90,8 @@ pub(crate) fn engines() -> Vec<SearchEngine> {
             ".compText"
         ),
         html!(
-            "mojeek",
-            "https://www.mojeek.com/search?q={query}",
-            "ul.results-standard > li",
-            "h2",
-            "h2 a",
-            ".s"
-        ),
-        html!(
             "qwant",
             "https://www.qwant.com/?q={query}&t=web",
-            "article",
-            "h2",
-            "a",
-            "p"
-        ),
-        html!(
-            "ecosia",
-            "https://www.ecosia.org/search?q={query}",
             "article",
             "h2",
             "a",

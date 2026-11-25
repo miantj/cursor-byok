@@ -129,6 +129,7 @@ async fn admitted_follow_up_reopens_the_actor_after_its_idle_timeout() {
                 Some(pb::agent_server_message::Message::InteractionUpdate(
                     pb::InteractionUpdate {
                         message: Some(pb::interaction_update::Message::TurnEnded(_)),
+                        ..
                     },
                 )) => break,
                 _ => {}

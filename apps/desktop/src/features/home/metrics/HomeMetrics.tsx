@@ -1,3 +1,4 @@
+import type { ModelTokenUsage } from "../../../shared/api";
 import { formatCompactInteger, formatInteger } from "../../../shared/utils/numberFormat";
 import { useAppStore } from "../../../shared/store/appStore";
 import { Icon } from "../../../shared/ui/Icon";
@@ -14,6 +15,7 @@ export type HomeMetricsData = {
   promptTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  modelTokenUsage: ModelTokenUsage[];
 };
 
 function formatMetricValue(value: number) {
@@ -59,7 +61,13 @@ function InfoTooltip({ content }: { content: string }) {
   ><Icon icon={informationOutlineIcon} size="1.1em" /></button>;
 }
 
-export function HomeMetrics({ data, refreshVersion = 0 }: { data: HomeMetricsData; refreshVersion?: number }) {
+export function HomeMetrics({ data, refreshVersion = 0, startDate, endDate, onDateChange }: {
+  data: HomeMetricsData;
+  refreshVersion?: number;
+  startDate: string;
+  endDate: string;
+  onDateChange: (startDate: string, endDate: string) => void;
+}) {
   const { pricing } = useAppStore();
   const inputTokens = Math.max(0, data.promptTokens - data.cacheReadTokens - data.cacheWriteTokens);
   const outputTokens = Math.max(0, data.tokenUsage - data.promptTokens);
@@ -135,34 +143,61 @@ export function HomeMetrics({ data, refreshVersion = 0 }: { data: HomeMetricsDat
 
   return <div className={styles.scroller}>
     <section className={styles.root} aria-label={t("调用统计")}>
-      <article className={styles.metric}>
-        <div className={styles.label}>{t("缓存命中率")}<InfoTooltip content={cacheTooltip} /></div>
-        <CacheHitRateChart rate={defaultCacheHitRate ?? 0} animationKey={refreshVersion} />
-      </article>
-      <article className={styles.metric}>
-        <div className={styles.label}>{t("LLM 调用")}<InfoTooltip content={callsTooltip} /></div>
-        <div className={styles.body}>
-          <div className={styles.value} title={formatInteger(data.llmCalls)}>{formatCompactInteger(data.llmCalls)}</div>
-          <div className={styles.secondary}>{t("成功 {successful} / 异常 {failed}", {
-            successful: formatCompactInteger(data.successfulCalls),
-            failed: formatCompactInteger(data.failedCalls),
-          })}</div>
-        </div>
-      </article>
-      <article className={styles.metric}>
-        <div className={styles.label}>{t("Token 消耗")}<InfoTooltip content={tokensTooltip} /></div>
-        <div className={styles.body}>
-          <div className={styles.value} title={formatInteger(data.tokenUsage)}>{formatCompactInteger(data.tokenUsage)}</div>
-          <div className={styles.secondary}>{t("提示词 {tokens}", { tokens: formatCompactInteger(data.promptTokens) })}</div>
-        </div>
-      </article>
-      <article className={styles.metric}>
-        <div className={styles.label}>{t("价值估算")}<InfoTooltip content={costTooltip} /></div>
-        <div className={styles.body}>
-          <div className={styles.value} title={formatUSD(totalCost)}>{formatUSD(totalCost)}</div>
-          <div className={styles.secondary}>{t("缓存读写 {cost}", { cost: formatUSD(cacheCost) })}</div>
-        </div>
-      </article>
+      <div className={styles.metrics}>
+        <article className={styles.metric}>
+          <div className={styles.label}>{t("缓存命中率")}<InfoTooltip content={cacheTooltip} /></div>
+          <CacheHitRateChart rate={defaultCacheHitRate ?? 0} animationKey={refreshVersion} />
+        </article>
+        <article className={styles.metric}>
+          <div className={styles.label}>{t("LLM 调用")}<InfoTooltip content={callsTooltip} /></div>
+          <div className={styles.body}>
+            <div className={styles.value} title={formatInteger(data.llmCalls)}>{formatCompactInteger(data.llmCalls)}</div>
+            <div className={styles.secondary}>{t("成功 {successful} / 异常 {failed}", {
+              successful: formatCompactInteger(data.successfulCalls),
+              failed: formatCompactInteger(data.failedCalls),
+            })}</div>
+          </div>
+        </article>
+        <article className={styles.metric}>
+          <div className={styles.label}>{t("Token 消耗")}<InfoTooltip content={tokensTooltip} /></div>
+          <div className={styles.body}>
+            <div className={styles.value} title={formatInteger(data.tokenUsage)}>{formatCompactInteger(data.tokenUsage)}</div>
+            <div className={styles.secondary}>{t("提示词 {tokens}", { tokens: formatCompactInteger(data.promptTokens) })}</div>
+          </div>
+        </article>
+        <article className={styles.metric}>
+          <div className={styles.label}>{t("价值估算")}<InfoTooltip content={costTooltip} /></div>
+          <div className={styles.body}>
+            <div className={styles.value} title={formatUSD(totalCost)}>{formatUSD(totalCost)}</div>
+            <div className={styles.secondary}>{t("缓存读写 {cost}", { cost: formatUSD(cacheCost) })}</div>
+          </div>
+        </article>
+      </div>
+      <div className={styles.dateFilter}>
+        <label>
+          <span>{t("开始时间")}</span>
+          <input type="date" value={startDate} disabled={!startDate} onChange={(event) => {
+            const next = event.target.value;
+            if (next) onDateChange(next, endDate < next ? next : endDate);
+          }} />
+        </label>
+        <label>
+          <span>{t("结束时间")}</span>
+          <input type="date" value={endDate} disabled={!endDate} onChange={(event) => {
+            const next = event.target.value;
+            if (next) onDateChange(startDate > next ? next : startDate, next);
+          }} />
+        </label>
+      </div>
+      {data.modelTokenUsage.length > 0 && <ul className={styles.models}>
+        {data.modelTokenUsage.map((model) => {
+          const name = model.model_name || t("未知模型");
+          return <li key={model.model_hash} className={styles.modelRow} title={`${name} ${formatInteger(model.token_usage)}`}>
+            <span className={styles.modelName}>{name}</span>
+            <span className={styles.modelTokens}>{formatCompactInteger(model.token_usage)}</span>
+          </li>;
+        })}
+      </ul>}
     </section>
   </div>;
 }

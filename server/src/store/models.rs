@@ -64,7 +64,7 @@ impl Store {
         let _write = self.writes.lock().await;
         let mut transaction = self.pool.begin().await?;
         for (hash, input) in &normalized {
-            insert_model(&mut transaction, hash, input, now).await?;
+            insert_model_with_conflict(&mut transaction, hash, input, now, false).await?;
         }
         transaction.commit().await?;
 
@@ -106,18 +106,14 @@ impl Store {
         current_hash: &str,
         input: &ModelConfigInput,
     ) -> Result<ModelConfig> {
-        let current = self
-            .model(current_hash)
-            .await?
-            .ok_or_else(|| Error::RunNotFound(format!("model {current_hash}")))?;
         let input = normalize_model_input(input)?;
         let next_hash = model_hash(&input)?;
         let now = now_ms();
         let _write = self.writes.lock().await;
         let mut transaction = self.pool.begin().await?;
-        if next_hash != current.model_hash {
+        if next_hash != current_hash {
             sqlx::query("UPDATE llm_calls SET model_hash = NULL WHERE model_hash = ?")
-                .bind(&current.model_hash)
+                .bind(current_hash)
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -158,7 +154,8 @@ impl Store {
         .bind(now)
         .bind(current_hash)
         .execute(&mut *transaction)
-        .await?;
+        .await
+        .map_err(model_already_exists)?;
         if result.rows_affected() != 1 {
             return Err(Error::RunNotFound(format!("model {current_hash}")));
         }
@@ -224,16 +221,6 @@ impl Store {
     }
 }
 
-async fn insert_model(
-    transaction: &mut Transaction<'_, Sqlite>,
-    hash: &str,
-    input: &ModelConfigInput,
-    now: i64,
-) -> Result<()> {
-    insert_model_with_conflict(transaction, hash, input, now, false).await?;
-    Ok(())
-}
-
 async fn insert_model_with_conflict(
     transaction: &mut Transaction<'_, Sqlite>,
     hash: &str,
@@ -281,8 +268,18 @@ async fn insert_model_with_conflict(
         .bind(now)
         .bind(now)
         .execute(&mut **transaction)
-        .await?;
+        .await
+        .map_err(model_already_exists)?;
     Ok(result.rows_affected() == 1)
+}
+
+fn model_already_exists(error: sqlx::Error) -> Error {
+    match &error {
+        sqlx::Error::Database(db) if db.is_unique_violation() => {
+            Error::Config("model already exists".into())
+        }
+        _ => Error::Database(error),
+    }
 }
 
 fn model_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ModelConfig> {
@@ -397,5 +394,30 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.model_hash, created.model_hash);
         assert_eq!(cleared.group_name, None);
+    }
+
+    #[tokio::test]
+    async fn creating_or_renaming_onto_an_existing_model_is_a_config_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        let created = store.create_model(&model_input(None)).await.unwrap();
+        let error = store.create_model(&model_input(None)).await.unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message == "model already exists"));
+
+        let mut other = model_input(None);
+        other.display_name = "Other".into();
+        let other = store.create_model(&other).await.unwrap();
+        let error = store
+            .update_model(&other.model_hash, &model_input(None))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message == "model already exists"));
+        assert_eq!(store.models().await.unwrap().len(), 2);
+        assert!(store.model(&created.model_hash).await.unwrap().is_some());
     }
 }

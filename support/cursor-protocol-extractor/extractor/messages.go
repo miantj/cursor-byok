@@ -248,6 +248,19 @@ func extractFieldObjects(arrayText string) []string {
 	return objects
 }
 
+// parseFieldNumber 解析字段编号，兼容压缩 JS 的科学计数法（如 1e3 → 1000）。
+func parseFieldNumber(raw string) (int, error) {
+	const maxFieldNumber = (1 << 29) - 1
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, err
+	}
+	if value < 1 || value > maxFieldNumber || value != float64(int(value)) {
+		return 0, fmt.Errorf("invalid protobuf field number: %s", raw)
+	}
+	return int(value), nil
+}
+
 // parseFieldObject 解析包含编号、名称、类型和修饰符的单个字段对象。
 func parseFieldObject(obj string) (*Field, error) {
 	// 提取字段编号。
@@ -255,7 +268,10 @@ func parseFieldObject(obj string) (*Field, error) {
 	if noMatch == nil {
 		return nil, errors.New("missing field no")
 	}
-	no, _ := strconv.Atoi(noMatch[1])
+	no, err := parseFieldNumber(noMatch[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid field no: %w", err)
+	}
 
 	// 提取字段名称。
 	nameMatch := nameRe.FindStringSubmatch(obj)

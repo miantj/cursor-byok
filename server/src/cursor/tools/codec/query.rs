@@ -77,6 +77,7 @@ pub fn tool_query(id: u32, call: &ToolCall) -> Result<pb::AgentServerMessage> {
                             .get("allow_multiple")
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
+                        ..Default::default()
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -175,6 +176,7 @@ pub fn tool_query(id: u32, call: &ToolCall) -> Result<pb::AgentServerMessage> {
                 args: Some(pb::McpAuthArgs {
                     server_identifier: string("server")?,
                     tool_call_id: call.call_id.clone(),
+                    ..Default::default()
                 }),
             })
         }

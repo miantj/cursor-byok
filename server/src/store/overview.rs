@@ -1,4 +1,3 @@
-//! Provides aggregate data for the control API.
 //! Efficient database aggregates for the desktop overview.
 
 use std::collections::BTreeMap;
@@ -7,7 +6,7 @@ use chrono::Utc;
 use sqlx::Row;
 
 use crate::{
-    model::{Overview, OverviewMetrics, TokenUsageBucket, TokenUsageGranularity},
+    model::{ModelTokenUsage, Overview, OverviewMetrics, TokenUsageBucket, TokenUsageGranularity},
     Result,
 };
 
@@ -28,27 +27,13 @@ impl Store {
         model_hashes: Option<&str>,
         bucket_ms: Option<i64>,
     ) -> Result<Overview> {
-        let call_row = sqlx::query(
+        let mut snapshot = self.pool.begin().await?;
+        let models = sqlx::query(&format!(
             "SELECT
-                COUNT(*) AS llm_calls,
+                COALESCE(NULLIF(model_hash, ''), NULLIF(model_id, ''), '') AS model_hash,
+                COALESCE(NULLIF(MAX(display_name), ''), NULLIF(MAX(model_id), ''), '') AS model_name,
                 COALESCE(SUM(status = 'completed'), 0) AS successful_calls,
-                COALESCE(SUM(status != 'completed'), 0) AS failed_calls
-             FROM llm_calls
-             WHERE status != 'running'
-               AND (? IS NULL OR created_at_ms >= ?)
-               AND (? IS NULL OR created_at_ms < ?)
-               AND (? IS NULL OR model_hash IN (SELECT value FROM json_each(?)))",
-        )
-        .bind(start_ms)
-        .bind(start_ms)
-        .bind(end_ms)
-        .bind(end_ms)
-        .bind(model_hashes)
-        .bind(model_hashes)
-        .fetch_one(&self.pool)
-        .await?;
-        let token_row = sqlx::query(&format!(
-            "SELECT
+                COALESCE(SUM(status NOT IN ('completed', 'running')), 0) AS failed_calls,
                 COALESCE(SUM({fresh_input}), 0) AS input_tokens,
                 COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0) AS cache_read_tokens,
                 COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0) AS cache_write_tokens,
@@ -56,7 +41,8 @@ impl Store {
              FROM llm_calls
              WHERE (? IS NULL OR created_at_ms >= ?)
                AND (? IS NULL OR created_at_ms < ?)
-               AND (? IS NULL OR model_hash IN (SELECT value FROM json_each(?)))",
+               AND (? IS NULL OR llm_calls.model_hash IN (SELECT value FROM json_each(?)))
+             GROUP BY 1",
             fresh_input = fresh_input_sql(),
         ))
         .bind(start_ms)
@@ -65,25 +51,49 @@ impl Store {
         .bind(end_ms)
         .bind(model_hashes)
         .bind(model_hashes)
-        .fetch_one(&self.pool)
+        .fetch_all(&mut *snapshot)
         .await?;
 
-        let input_tokens = non_negative(token_row.try_get("input_tokens")?);
-        let cache_read_tokens = non_negative(token_row.try_get("cache_read_tokens")?);
-        let cache_write_tokens = non_negative(token_row.try_get("cache_write_tokens")?);
-        let output_tokens = non_negative(token_row.try_get("output_tokens")?);
-        let prompt_tokens = saturating_sum(&[input_tokens, cache_read_tokens, cache_write_tokens]);
-        let metrics = OverviewMetrics {
-            llm_calls: call_row.try_get("llm_calls")?,
-            successful_calls: call_row.try_get("successful_calls")?,
-            failed_calls: call_row.try_get("failed_calls")?,
-            token_usage: prompt_tokens.saturating_add(output_tokens),
-            prompt_tokens,
-            input_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            output_tokens,
-        };
+        let mut metrics = OverviewMetrics::default();
+        let mut model_token_usage = Vec::with_capacity(models.len());
+        for row in models {
+            let input_tokens = non_negative(row.try_get("input_tokens")?);
+            let cache_read_tokens = non_negative(row.try_get("cache_read_tokens")?);
+            let cache_write_tokens = non_negative(row.try_get("cache_write_tokens")?);
+            let output_tokens = non_negative(row.try_get("output_tokens")?);
+            metrics.successful_calls += row.try_get::<i64, _>("successful_calls")?;
+            metrics.failed_calls += row.try_get::<i64, _>("failed_calls")?;
+            metrics.input_tokens = metrics.input_tokens.saturating_add(input_tokens);
+            metrics.cache_read_tokens = metrics.cache_read_tokens.saturating_add(cache_read_tokens);
+            metrics.cache_write_tokens = metrics
+                .cache_write_tokens
+                .saturating_add(cache_write_tokens);
+            metrics.output_tokens = metrics.output_tokens.saturating_add(output_tokens);
+            model_token_usage.push(ModelTokenUsage {
+                model_hash: row.try_get("model_hash")?,
+                model_name: row.try_get("model_name")?,
+                token_usage: saturating_sum(&[
+                    input_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    output_tokens,
+                ]),
+            });
+        }
+        metrics.llm_calls = metrics.successful_calls + metrics.failed_calls;
+        metrics.prompt_tokens = saturating_sum(&[
+            metrics.input_tokens,
+            metrics.cache_read_tokens,
+            metrics.cache_write_tokens,
+        ]);
+        metrics.token_usage = metrics.prompt_tokens.saturating_add(metrics.output_tokens);
+        model_token_usage.sort_by(|left, right| {
+            right
+                .token_usage
+                .cmp(&left.token_usage)
+                .then_with(|| left.model_name.cmp(&right.model_name))
+                .then_with(|| left.model_hash.cmp(&right.model_hash))
+        });
 
         let (token_usage_granularity, bucket_ms, series_start_ms, bucket_count) =
             token_usage_buckets(start_ms, end_ms, bucket_ms);
@@ -107,8 +117,9 @@ impl Store {
         .bind(end_ms)
         .bind(model_hashes)
         .bind(model_hashes)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *snapshot)
         .await?;
+        snapshot.commit().await?;
         let mut recorded = rows
             .into_iter()
             .map(|row| {
@@ -139,6 +150,7 @@ impl Store {
 
         Ok(Overview {
             metrics,
+            model_token_usage,
             token_usage_granularity,
             token_usage_series,
         })

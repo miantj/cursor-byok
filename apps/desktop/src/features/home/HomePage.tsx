@@ -8,9 +8,10 @@ import type { VirtualPageSection } from "../../shell/layout/VirtualPage";
 import { OverviewTimeRangeFilter, type OverviewRangePreset, type QuickPreset } from "./overview/OverviewTimeRangeFilter";
 import { PageActions } from "../../shell/PageActions";
 import { appStore, useAppStore } from "../../shared/store/appStore";
-import { formatTimeInput, parseTimeInput } from "../../shared/utils/parseTimeInput";
+import { formatDateInput, formatTimeInput, parseDateInput, parseTimeInput } from "../../shared/utils/parseTimeInput";
 import { modelProviderName } from "../../shared/utils/modelProvider";
 import { claudeIcon, flatColorOrganizationIcon, openAiIcon } from "../../shared/ui/icons";
+import { message } from "../../shared/ui/message";
 import { useI18n } from "../../i18n/store";
 
 type TimeRange = { startMs: number; endMs: number };
@@ -77,6 +78,8 @@ export function HomePage() {
       modelHashes: appliedModels,
     }).then((next) => {
       if (active) setRangeOverview(next);
+    }).catch((error: unknown) => {
+      if (active) message(error);
     }).finally(() => {
       if (active) setRangeBusy(false);
     });
@@ -100,6 +103,7 @@ export function HomePage() {
     promptTokens: filteredOverview.metrics.prompt_tokens,
     cacheReadTokens: filteredOverview.metrics.cache_read_tokens,
     cacheWriteTokens: filteredOverview.metrics.cache_write_tokens,
+    modelTokenUsage: filteredOverview.model_token_usage,
   };
   const openCustom = (open: boolean) => {
     if (open && !customStart && !customEnd) {
@@ -109,26 +113,39 @@ export function HomePage() {
     }
     setCustomOpen(open);
   };
+  const commitCustomRange = (range: TimeRange, quickPreset: QuickPreset | null = null) => {
+    setCustomRange(range);
+    setQuick(quickPreset);
+    setPreset("custom");
+    setCustomOpen(false);
+  };
   const applyCustom = () => {
     const startMs = parseTimeInput(customStart);
     const endMs = parseTimeInput(customEnd);
     if (startMs === null || endMs === null || startMs >= endMs) return;
-    setCustomRange({ startMs, endMs });
     setAppliedModels(selectedModels);
-    setQuick(null);
-    setPreset("custom");
-    setCustomOpen(false);
+    commitCustomRange({ startMs, endMs });
   };
   const selectQuick = (durationMs: number) => {
     const end = new Date();
     const start = new Date(end.getTime() - durationMs);
     setCustomStart(formatTimeInput(start));
     setCustomEnd(formatTimeInput(end));
-    setCustomRange({ startMs: start.getTime(), endMs: end.getTime() });
     setAppliedModels(selectedModels);
-    setQuick(durationMs === 4 * 60 * 60_000 ? "four-hours" : "twenty-four-hours");
-    setPreset("custom");
-    setCustomOpen(false);
+    commitCustomRange(
+      { startMs: start.getTime(), endMs: end.getTime() },
+      durationMs === 4 * 60 * 60_000 ? "four-hours" : "twenty-four-hours",
+    );
+  };
+  const applyDates = (startDate: string, endDate: string) => {
+    const start = parseDateInput(startDate);
+    const end = parseDateInput(endDate);
+    if (!start || !end) return;
+    const endMs = end.setHours(24, 0, 0, 0);
+    if (start.getTime() >= endMs) return;
+    setCustomStart(formatTimeInput(start));
+    setCustomEnd(formatTimeInput(end));
+    commitCustomRange({ startMs: start.getTime(), endMs });
   };
   const selectPreset = (value: Exclude<OverviewRangePreset, "custom">) => {
     setPreset(value);
@@ -168,8 +185,14 @@ export function HomePage() {
     },
     {
       key: "metrics",
-      estimatedHeight: 130,
-      content: <HomeMetrics data={metrics} refreshVersion={refreshVersion} />,
+      estimatedHeight: 176 + metrics.modelTokenUsage.length * 24,
+      content: <HomeMetrics
+        data={metrics}
+        refreshVersion={refreshVersion}
+        startDate={selectedRange ? formatDateInput(new Date(selectedRange.startMs)) : ""}
+        endDate={selectedRange ? formatDateInput(new Date(selectedRange.endMs - 1)) : ""}
+        onDateChange={applyDates}
+      />,
     },
 
     {

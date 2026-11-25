@@ -2,8 +2,15 @@
 use cursor_server::{App, Config, Result};
 use tracing_subscriber::prelude::*;
 
+fn main() -> Result<()> {
+    if cursor_server::local_app::release_proxy_if_requested() {
+        return Ok(());
+    }
+    serve()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn serve() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()

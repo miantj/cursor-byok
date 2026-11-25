@@ -140,6 +140,7 @@ async fn new_chat_nudges_cannot_silently_replace_the_selected_model() {
                 model_id: model_id.into(),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let body = fixture
             .rpc(

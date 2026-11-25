@@ -18,6 +18,7 @@
   "092b520558eff5f2": "Not tested",
   "099008ea7a42ebd1": "All custom Header values must be strings",
   "09ebc2643631ba25": "Estimated value",
+  "0a9156766e0a2c67": "Unknown model",
   "0b96da34f6fbdd3b": "Cache read: {tokens} × ${price}/1M = {cost}",
   "0bbb2c0ce279d6d5": "Models not synced yet",
   "0c70665b6eb65f1a": "No",

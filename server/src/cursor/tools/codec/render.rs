@@ -262,6 +262,7 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
                 args: Some(pb::McpAuthArgs {
                     server_identifier: server_identifier.into(),
                     tool_call_id: call.call_id.clone(),
+                    ..Default::default()
                 }),
                 result: None,
             })),

@@ -187,6 +187,29 @@ fn cursor_user_image_uses_image_field() {
     let encoded = wire_message(&projected[0], "model", None).unwrap();
     assert_eq!(encoded["content"][1]["image"], "AQID");
     assert!(encoded["content"][1].get("data").is_none());
+
+    let uint8 = json!({
+        "role": "user",
+        "id": "user-image",
+        "content": [{
+            "type": "image",
+            "mimeType": "image/jpeg",
+            "image": {"__type": "Uint8Array", "hex": "ffd8"},
+        }],
+    });
+    let message = decode(
+        serde_json::to_vec(&uint8).unwrap().as_slice(),
+        "cursor-root:user-image".into(),
+    )
+    .unwrap();
+    assert!(matches!(
+        &message.content,
+        MessageContent::Parts { parts }
+            if parts[0] == ContentPart::Image {
+                mime_type: "image/jpeg".into(),
+                data: vec![0xff, 0xd8],
+            }
+    ));
 }
 
 #[test]

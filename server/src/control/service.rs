@@ -477,21 +477,25 @@ impl ControlService {
     pub async fn discover_models(&self, input: &ModelDiscoveryInput) -> Result<DiscoveredModels> {
         let client = self.clients.default_client().await?;
         let base_url = crate::model::normalize_request_url(&input.base_url)?;
-        discover_models_from_endpoint(
-            &client,
-            match input.model_type {
-                ModelType::OpenAi => ProviderType::OpenAiResponses,
-                ModelType::Anthropic => ProviderType::Anthropic,
-            },
-            &base_url,
-            &input.api_key,
-            if input.custom_headers_enabled {
-                &input.custom_headers
-            } else {
-                empty_json_object_ref()
-            },
+        tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            discover_models_from_endpoint(
+                &client,
+                match input.model_type {
+                    ModelType::OpenAi => ProviderType::OpenAiResponses,
+                    ModelType::Anthropic => ProviderType::Anthropic,
+                },
+                &base_url,
+                &input.api_key,
+                if input.custom_headers_enabled {
+                    &input.custom_headers
+                } else {
+                    empty_json_object_ref()
+                },
+            ),
         )
         .await
+        .map_err(|_| Error::Provider("model discovery timed out".into()))?
     }
 
     pub async fn import_v0049_models(&self) -> Result<LegacyModelImportResult> {
@@ -927,21 +931,69 @@ async fn openai_models_at(
     api_key: &str,
     custom_headers: &serde_json::Value,
 ) -> Result<Vec<String>> {
-    let mut request = client.get(url);
-    if !api_key.is_empty() {
-        request = request.bearer_auth(api_key);
+    let mut models = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut page = None;
+    loop {
+        let mut request = client.get(url.clone());
+        if !api_key.is_empty() {
+            request = request.bearer_auth(api_key);
+        }
+        if let Some(cursor) = &page {
+            request = request.query(&[cursor]);
+        }
+        let response = apply_discovery_headers(request, custom_headers)?
+            .send()
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        if !status.is_success() {
+            return Err(Error::Provider(format!(
+                "model discovery failed ({status}): {body}"
+            )));
+        }
+        let data = body.get("data").filter(|value| value.as_array().is_some());
+        if let Some(items) = body.get("models").filter(|_| data.is_none()) {
+            models.extend(
+                model_ids(items)
+                    .into_iter()
+                    .map(|id| id.strip_prefix("models/").unwrap_or(&id).to_owned()),
+            );
+        } else {
+            models.extend(model_ids(data.unwrap_or(&body)));
+        }
+        let next = [
+            ("nextPageToken", "pageToken"),
+            ("next_page_token", "page_token"),
+        ]
+        .into_iter()
+        .find_map(|(field, param)| {
+            body[field]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|token| (param, token))
+        });
+        let (param, token) = match (next, body["has_more"].as_bool()) {
+            (Some(cursor), _) => cursor,
+            (None, Some(true)) => (
+                "after",
+                body["last_id"]
+                    .as_str()
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| {
+                        Error::Provider("model response has_more without last_id".into())
+                    })?,
+            ),
+            _ => return Ok(models),
+        };
+        let cursor = (param, token.to_owned());
+        if !seen.insert(cursor.clone()) {
+            return Err(Error::Provider(
+                "model discovery repeated a page cursor".into(),
+            ));
+        }
+        page = Some(cursor);
     }
-    let response = apply_discovery_headers(request, custom_headers)?
-        .send()
-        .await?;
-    let status = response.status();
-    let body: serde_json::Value = response.json().await?;
-    if !status.is_success() {
-        return Err(Error::Provider(format!(
-            "model discovery failed ({status}): {body}"
-        )));
-    }
-    Ok(model_ids(body.get("data").unwrap_or(&body)))
 }
 
 async fn anthropic_models(
@@ -1055,4 +1107,72 @@ fn apply_discovery_headers(
         request = request.header(name, value);
     }
     Ok(request)
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use axum::{extract::Query, routing::get, Json, Router};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn discovers_neon_on_the_second_page() {
+        let app = Router::new().route("/models", get(|Query(query): Query<BTreeMap<String, String>>| async move {
+            Json(if query.get("pageToken").map(String::as_str) == Some("page+2") {
+                json!({"models": [{"name": "models/gemini-4-neon"}, {"name": "models/other"}]})
+            } else {
+                json!({"models": [{"name": "models/other"}], "nextPageToken": "page+2"})
+            })
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = discover_models_from_endpoint(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            ProviderType::OpenAiChat,
+            &url,
+            "",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(result.models, ["gemini-4-neon", "other"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_later_page_does_not_return_a_partial_list() {
+        let app = Router::new().route(
+            "/models",
+            get(|Query(query): Query<BTreeMap<String, String>>| async move {
+                if query.get("after").map(String::as_str) == Some("first") {
+                    (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": "unavailable"})),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(
+                            json!({"data":[{"id":"first"}], "has_more": true, "last_id": "first"}),
+                        ),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error = discover_models_from_endpoint(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            ProviderType::OpenAiChat,
+            &url,
+            "",
+            &json!({}),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+        assert!(error.to_string().contains("502"));
+    }
 }

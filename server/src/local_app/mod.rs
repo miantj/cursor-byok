@@ -2,6 +2,7 @@
 mod account;
 mod ca;
 mod proxy;
+mod proxy_release;
 mod settings;
 
 use std::{net::SocketAddr, sync::Arc};
@@ -27,6 +28,8 @@ pub(crate) fn request_uses_local_cursor_token(headers: &axum::http::HeaderMap) -
         .and_then(|value| value.to_str().ok())
         .is_some_and(account::is_local_cursor_authorization)
 }
+
+pub use proxy_release::release_proxy_if_requested;
 
 #[cfg(test)]
 pub(crate) fn local_cursor_authorization() -> String {
@@ -104,6 +107,9 @@ impl CursorHarness {
     }
 
     pub async fn cleanup_stale_settings(&self) -> Result<()> {
+        let Some(_ownership) = proxy_release::try_lock()? else {
+            return Ok(());
+        };
         settings::clear_stale_managed_settings()
     }
 
@@ -180,10 +186,8 @@ impl CursorHarness {
             .read()
             .ok_or_else(|| Error::Config("desktop management server is not ready".into()))?;
         let mut proxy = self.inner.proxy.lock().await;
-        if proxy.running() {
-            if let Some(url) = proxy.url() {
-                apply_cursor_configuration(&url).await?;
-            }
+        if let Some(url) = proxy.url() {
+            apply_cursor_configuration(&url).await?;
             return Ok(());
         }
         let ca = self.inner.ca.load()?;
@@ -198,20 +202,18 @@ impl CursorHarness {
             )
             .await?;
         if let Err(error) = self.inner.store.set_proxy_port(actual_port).await {
-            proxy.stop().await;
+            proxy.stop().await?;
             return Err(error);
         }
         if let Err(error) = apply_cursor_configuration(&url).await {
-            proxy.stop().await;
+            proxy.stop().await?;
             return Err(error);
         }
         Ok(())
     }
 
     pub async fn disable(&self) -> Result<()> {
-        settings::clear_proxy_settings()?;
-        self.inner.proxy.lock().await.stop().await;
-        Ok(())
+        self.inner.proxy.lock().await.stop().await
     }
 }
 

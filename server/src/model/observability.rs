@@ -270,8 +270,16 @@ mod overview {
     }
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+    pub struct ModelTokenUsage {
+        pub model_hash: String,
+        pub model_name: String,
+        pub token_usage: i64,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
     pub struct Overview {
         pub metrics: OverviewMetrics,
+        pub model_token_usage: Vec<ModelTokenUsage>,
         pub token_usage_granularity: TokenUsageGranularity,
         pub token_usage_series: Vec<TokenUsageBucket>,
     }

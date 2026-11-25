@@ -166,22 +166,43 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
                 "BidiAppend contains no AgentClientMessage".into(),
             ));
         }
-        ("", payload) => agent::AgentClientMessage::decode(payload),
+        ("", payload) => decode_agent_message("data_binary", payload)?,
         (data, []) => {
             let payload = hex::decode(data)
                 .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
-            agent::AgentClientMessage::decode(payload.as_slice())
+            decode_agent_message("data_hex", payload.as_slice())?
         }
         _ => {
             return Err(Error::Protocol(
                 "BidiAppend must use a single payload encoding".into(),
             ));
         }
-    }?;
+    };
     Ok(DecodedAppend {
         request_id: request_id.into(),
         seqno: request.append_seqno,
         message,
+    })
+}
+
+fn decode_agent_message(encoding: &str, payload: &[u8]) -> Result<agent::AgentClientMessage> {
+    agent::AgentClientMessage::decode(payload).map_err(|error| {
+        // Dump failing wire bytes once so schema drift can be diagnosed offline.
+        let dump = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join(".cursor-byok-v3/logs/last-failed-bidi-agent.bin");
+        let _ = std::fs::write(&dump, payload);
+        let _ = std::fs::write(
+            dump.with_extension("txt"),
+            format!(
+                "encoding={encoding}\nlen={}\nerror={error}\nhex={}\n",
+                payload.len(),
+                hex::encode(payload)
+            ),
+        );
+        Error::Protocol(format!(
+            "invalid BidiAppend AgentClientMessage (encoding={encoding}, len={}): {error}",
+            payload.len()
+        ))
     })
 }
 
@@ -199,10 +220,17 @@ pub async fn append(
     {
         return Err(Error::Protocol("Cursor parent ids are required".into()));
     }
-    let replace_closing = request.model_id().is_some();
-    let handle = registry
-        .get_or_create_for_append(&request.request_id, replace_closing)
-        .await?;
+    let handle = if request.model_id().is_some() {
+        registry
+            .get_or_create_for_append(&request.request_id, true)
+            .await?
+    } else if let Some(handle) = registry.local(&request.request_id).await {
+        handle
+    } else if registry.recently_closed(&request.request_id) {
+        return Ok(ai::BidiAppendResponse {});
+    } else {
+        return Err(Error::RunNotFound(request.request_id));
+    };
     let _admission = handle.admit()?;
     if let Some(conversation_id) = request.conversation_id() {
         handle.set_conversation_id(conversation_id)?;
@@ -230,4 +258,52 @@ pub(super) fn append_response() -> axum::http::Response<axum::body::Body> {
         .header(axum::http::header::CONTENT_TYPE, "application/proto")
         .body(axum::body::Body::empty())
         .expect("static append response")
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::decode_agent_message;
+    use crate::cursor::protocol::proto::agent::v1 as pb;
+
+    #[test]
+    fn decode_failure_describes_the_payload_without_echoing_it() {
+        let err = decode_agent_message("data_binary", b"\x06secret").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("encoding=data_binary, len=7"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("06736563726574"));
+    }
+
+    #[test]
+    fn decodes_run_request_with_current_conversation_state_fields() {
+        let payload = pb::AgentClientMessage {
+            message: Some(pb::agent_client_message::Message::RunRequest(
+                pb::AgentRunRequest {
+                    conversation_id: Some("c1".into()),
+                    run_id: Some("r1".into()),
+                    conversation_state: Some(pb::ConversationStateStructure {
+                        user_time_zone: Some("Asia/Shanghai".into()),
+                        turns_cleared: Some(true),
+                        project_prompt_turn_count: Some(2),
+                        ..Default::default()
+                    }),
+                    client_supports_routed_model_update: Some(true),
+                    emit_model_call_usage: Some(true),
+                    ..Default::default()
+                },
+            )),
+        }
+        .encode_to_vec();
+
+        let decoded = decode_agent_message("data_binary", &payload).unwrap();
+        let Some(pb::agent_client_message::Message::RunRequest(request)) = decoded.message else {
+            panic!("expected run_request");
+        };
+        let state = request.conversation_state.unwrap();
+        assert_eq!(state.user_time_zone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(state.turns_cleared, Some(true));
+        assert_eq!(request.emit_model_call_usage, Some(true));
+    }
 }

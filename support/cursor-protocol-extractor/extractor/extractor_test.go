@@ -14,6 +14,21 @@ func TestParseFieldObjectSupportsShorthandType(t *testing.T) {
 	}
 }
 
+// TestParseFieldObjectSupportsScientificFieldNumber 验证 1e3 这类字段号不会被截成 1。
+func TestParseFieldObjectSupportsScientificFieldNumber(t *testing.T) {
+	for _, input := range []string{"1000", "1e3", "1E+3", "1.0e3", "10000e-1"} {
+		field, err := parseFieldObject(`{no:` + input + `,name:"uploaded",kind:"message",T:GJs,oneof:"result"}`)
+		if err != nil || field.No != 1000 {
+			t.Fatalf("parse %q: got %v, %v; want field 1000", input, field, err)
+		}
+	}
+	for _, input := range []string{"0", "1e", "1e-1", "1.5", "536870912"} {
+		if _, err := parseFieldObject(`{no:` + input + `,name:"uploaded",kind:"message",T:GJs,oneof:"result"}`); err == nil {
+			t.Fatalf("accepted invalid field no %q", input)
+		}
+	}
+}
+
 // TestWebpackExportAliasResolvesServiceMessageType 验证 Webpack 导出别名可解析服务消息。
 func TestWebpackExportAliasResolvesServiceMessageType(t *testing.T) {
 	const bundle = `

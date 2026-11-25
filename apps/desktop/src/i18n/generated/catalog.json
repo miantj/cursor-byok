@@ -21,7 +21,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 92,
+          "line": 100,
           "column": 5
         }
       ]
@@ -63,7 +63,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 112,
+          "line": 120,
           "column": 5
         }
       ]
@@ -94,7 +94,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 127,
+          "line": 135,
           "column": 5
         }
       ]
@@ -201,7 +201,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 104,
+          "line": 112,
           "column": 5
         }
       ]
@@ -215,7 +215,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 101,
+          "line": 109,
           "column": 5
         }
       ]
@@ -283,8 +283,20 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 160,
-          "column": 40
+          "line": 169,
+          "column": 42
+        }
+      ]
+    },
+    "0a9156766e0a2c67": {
+      "source": "未知模型",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/home/metrics/HomeMetrics.tsx",
+          "line": 194,
+          "column": 44
         }
       ]
     },
@@ -299,7 +311,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 122,
+          "line": 130,
           "column": 5
         }
       ]
@@ -491,7 +503,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 109,
+          "line": 117,
           "column": 5
         }
       ]
@@ -503,8 +515,8 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 153,
-          "column": 40
+          "line": 162,
+          "column": 42
         }
       ]
     },
@@ -573,8 +585,8 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 139,
-          "column": 40
+          "line": 148,
+          "column": 42
         }
       ]
     },
@@ -655,7 +667,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 91,
+          "line": 99,
           "column": 5
         }
       ]
@@ -807,7 +819,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 99,
+          "line": 107,
           "column": 5
         }
       ]
@@ -841,7 +853,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 82,
+          "line": 90,
           "column": 5
         }
       ]
@@ -1078,7 +1090,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 89,
+          "line": 97,
           "column": 5
         }
       ]
@@ -1215,7 +1227,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 81,
+          "line": 89,
           "column": 5
         }
       ]
@@ -1476,8 +1488,8 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 146,
-          "column": 46
+          "line": 155,
+          "column": 48
         }
       ]
     },
@@ -1834,7 +1846,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 94,
+          "line": 102,
           "column": 5
         }
       ]
@@ -1944,7 +1956,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 26,
+          "line": 28,
           "column": 27
         },
         {
@@ -2481,7 +2493,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 133,
+          "line": 141,
           "column": 5
         }
       ]
@@ -2548,7 +2560,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 93,
+          "line": 101,
           "column": 5
         }
       ]
@@ -2574,7 +2586,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 103,
+          "line": 111,
           "column": 5
         }
       ]
@@ -2651,7 +2663,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 525,
+          "line": 532,
           "column": 43
         }
       ]
@@ -2737,8 +2749,8 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 156,
-          "column": 46
+          "line": 165,
+          "column": 48
         }
       ]
     },
@@ -2812,6 +2824,11 @@
       "kind": "text",
       "placeholders": [],
       "refs": [
+        {
+          "file": "features/home/metrics/HomeMetrics.tsx",
+          "line": 178,
+          "column": 18
+        },
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
           "line": 121,
@@ -2901,8 +2918,8 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 163,
-          "column": 46
+          "line": 172,
+          "column": 48
         }
       ]
     },
@@ -2925,12 +2942,12 @@
       "refs": [
         {
           "file": "shared/store/appStore.ts",
-          "line": 218,
+          "line": 219,
           "column": 23
         },
         {
           "file": "shared/store/appStore.ts",
-          "line": 225,
+          "line": 226,
           "column": 25
         }
       ]
@@ -2990,7 +3007,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 520,
+          "line": 527,
           "column": 43
         }
       ]
@@ -3002,7 +3019,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 137,
+          "line": 145,
           "column": 50
         }
       ]
@@ -3168,7 +3185,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 464,
+          "line": 471,
           "column": 21
         }
       ]
@@ -3343,7 +3360,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 54,
+          "line": 56,
           "column": 17
         }
       ]
@@ -4335,7 +4352,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 117,
+          "line": 125,
           "column": 5
         }
       ]
@@ -4511,7 +4528,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 100,
+          "line": 108,
           "column": 5
         }
       ]
@@ -4576,7 +4593,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 102,
+          "line": 110,
           "column": 5
         }
       ]
@@ -4957,7 +4974,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 110,
+          "line": 118,
           "column": 5
         }
       ]
@@ -5424,7 +5441,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 97,
+          "line": 105,
           "column": 5
         }
       ]
@@ -5652,8 +5669,8 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 143,
-          "column": 40
+          "line": 152,
+          "column": 42
         }
       ]
     },
@@ -6031,6 +6048,11 @@
       "placeholders": [],
       "refs": [
         {
+          "file": "features/home/metrics/HomeMetrics.tsx",
+          "line": 185,
+          "column": 18
+        },
+        {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
           "line": 122,
           "column": 21
@@ -6263,7 +6285,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 83,
+          "line": 91,
           "column": 5
         }
       ]
@@ -6287,7 +6309,7 @@
       "refs": [
         {
           "file": "shared/ui/Select.tsx",
-          "line": 142,
+          "line": 148,
           "column": 90
         }
       ]
@@ -6299,7 +6321,7 @@
       "refs": [
         {
           "file": "features/home/metrics/HomeMetrics.tsx",
-          "line": 106,
+          "line": 114,
           "column": 5
         }
       ]
@@ -6347,7 +6369,7 @@
       "refs": [
         {
           "file": "features/home/HomePage.tsx",
-          "line": 201,
+          "line": 224,
           "column": 25
         }
       ]

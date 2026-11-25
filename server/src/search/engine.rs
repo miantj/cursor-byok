@@ -165,6 +165,16 @@ impl JsonEngine {
         client: &reqwest::Client,
         query: &str,
     ) -> Result<Vec<SearchHit>, String> {
+        let query = if self.id == "npm" {
+            // registry.npmjs.org 拒绝超过 64 个字符的 text。
+            let npm_query = truncate_chars(query, 64).trim_end();
+            if npm_query.chars().count() < 2 {
+                return Ok(Vec::new());
+            }
+            npm_query
+        } else {
+            query
+        };
         let response = client
             .get(search_url(&self.url, query))
             .header(reqwest::header::USER_AGENT, user_agent())
@@ -255,6 +265,13 @@ fn text(element: ElementRef<'_>) -> String {
         .join(" ")
 }
 
+fn truncate_chars(value: &str, max_chars: usize) -> &str {
+    match value.char_indices().nth(max_chars) {
+        Some((index, _)) => &value[..index],
+        None => value,
+    }
+}
+
 fn search_url(template: &str, query: &str) -> String {
     template.replace(
         "{query}",
@@ -336,4 +353,16 @@ fn redirected_target(url: &Url) -> Option<Url> {
     url.query_pairs()
         .find(|(name, _)| name == key)
         .and_then(|(_, value)| Url::parse(&value).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn npm_text_is_cut_on_a_character_boundary() {
+        assert_eq!(truncate_chars("react", 64), "react");
+        assert_eq!(truncate_chars(&"a".repeat(80), 64).chars().count(), 64);
+        assert_eq!(truncate_chars("你".repeat(3).as_str(), 2), "你你");
+    }
 }

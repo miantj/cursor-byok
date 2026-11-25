@@ -122,8 +122,8 @@ async fn summarize_replaces_model_history_and_preserves_cursor_history() {
     assert_eq!(compacted_state.turns.len(), old_turns.len() + 1);
     assert_eq!(compacted_state.self_summary_count, 1);
     let summary_id = compacted_state.summary.as_ref().unwrap();
-    let summary = pb::ConversationSummary::decode(compacted.blobs[summary_id].as_slice()).unwrap();
-    assert_eq!(summary.summary, "Durable summary");
+    let summary = std::str::from_utf8(&compacted.blobs[summary_id]).unwrap();
+    assert_eq!(summary, "Durable summary");
     let archive_id = compacted_state.summary_archive.as_ref().unwrap();
     let archive =
         pb::ConversationSummaryArchive::decode(compacted.blobs[archive_id].as_slice()).unwrap();
